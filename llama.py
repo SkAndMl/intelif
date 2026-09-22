@@ -244,12 +244,17 @@ class LlamaForCausalLM(nn.Module):
         return self.lm_head(hidden)
 
 
-def load_hf_weights(model: LlamaForCausalLM, model_id: str, revision: str = "main") -> LlamaForCausalLM:
+def fetch_hf_state(model_id: str, revision: str = "main") -> dict[str, Tensor]:
     from huggingface_hub import hf_hub_download
     from safetensors.torch import load_file
 
     state = load_file(hf_hub_download(model_id, "model.safetensors", revision=revision))
-    state = {k: v.to(torch.float32) for k, v in state.items()}
+
+    return {k: v.to(torch.float32) for k, v in state.items()}
+
+
+def load_hf_weights(model: LlamaForCausalLM, model_id: str, revision: str = "main") -> LlamaForCausalLM:
+    state = fetch_hf_state(model_id, revision)
 
     if model.cfg.tie_word_embeddings:
         state.pop("lm_head.weight", None)
