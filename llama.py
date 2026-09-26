@@ -21,6 +21,7 @@ class ModelConfig:
     attention_bias: bool = False
     mlp_bias: bool = False
     context_length: int = 8192
+    dtype: torch.dtype = torch.float16
 
     def __post_init__(self):
         assert self.model_dim == self.head_dim * self.num_heads
@@ -51,10 +52,14 @@ class LlamaRotaryEmbedding(nn.Module):
         super().__init__()
 
         exponent = torch.arange(0, cfg.head_dim, 2, dtype=torch.float32) / cfg.head_dim
-        self.register_buffer("inv_freq", 1.0 / (cfg.rope_base**exponent), persistent=False)
+        self.register_buffer(
+            "inv_freq", 1.0 / (cfg.rope_base**exponent), persistent=False
+        )
 
     def forward(self, x: Tensor, position_ids: Tensor) -> tuple[Tensor, Tensor]:
-        inv_freq = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        inv_freq = (
+            self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        )
         positions = position_ids[:, None, :].float()
 
         freqs = (inv_freq @ positions).transpose(1, 2)
@@ -69,7 +74,9 @@ def rotate_half(x: Tensor) -> Tensor:
     return torch.cat((-right, left), dim=-1)
 
 
-def apply_rotary_pos_emb(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> tuple[Tensor, Tensor]:
+def apply_rotary_pos_emb(
+    q: Tensor, k: Tensor, cos: Tensor, sin: Tensor
+) -> tuple[Tensor, Tensor]:
     cos = cos.unsqueeze(1)
     sin = sin.unsqueeze(1)
 
@@ -110,12 +117,26 @@ class LlamaAttention(nn.Module):
             bias=cfg.attention_bias,
         )
 
-    def forward(self, x: Tensor, cos: Tensor, sin: Tensor, mask: Tensor | None) -> Tensor:
+    def forward(
+        self, x: Tensor, cos: Tensor, sin: Tensor, mask: Tensor | None
+    ) -> Tensor:
         b, t, _ = x.shape
 
-        q = self.q_proj(x).view(b, t, self.cfg.num_heads, self.cfg.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(b, t, self.cfg.num_kv_heads, self.cfg.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(b, t, self.cfg.num_kv_heads, self.cfg.head_dim).transpose(1, 2)
+        q = (
+            self.q_proj(x)
+            .view(b, t, self.cfg.num_heads, self.cfg.head_dim)
+            .transpose(1, 2)
+        )
+        k = (
+            self.k_proj(x)
+            .view(b, t, self.cfg.num_kv_heads, self.cfg.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.v_proj(x)
+            .view(b, t, self.cfg.num_kv_heads, self.cfg.head_dim)
+            .transpose(1, 2)
+        )
 
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
@@ -137,9 +158,15 @@ class LlamaMLP(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
 
-        self.gate_proj = nn.Linear(cfg.model_dim, cfg.intermediate_size, bias=cfg.mlp_bias)
-        self.up_proj = nn.Linear(cfg.model_dim, cfg.intermediate_size, bias=cfg.mlp_bias)
-        self.down_proj = nn.Linear(cfg.intermediate_size, cfg.model_dim, bias=cfg.mlp_bias)
+        self.gate_proj = nn.Linear(
+            cfg.model_dim, cfg.intermediate_size, bias=cfg.mlp_bias
+        )
+        self.up_proj = nn.Linear(
+            cfg.model_dim, cfg.intermediate_size, bias=cfg.mlp_bias
+        )
+        self.down_proj = nn.Linear(
+            cfg.intermediate_size, cfg.model_dim, bias=cfg.mlp_bias
+        )
 
     def forward(self, x: Tensor) -> Tensor:
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
@@ -154,18 +181,24 @@ class LlamaDecoderLayer(nn.Module):
         self.input_layernorm = LlamaRMSNorm(cfg.model_dim, cfg.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(cfg.model_dim, cfg.rms_norm_eps)
 
-    def forward(self, x: Tensor, cos: Tensor, sin: Tensor, mask: Tensor | None) -> Tensor:
+    def forward(
+        self, x: Tensor, cos: Tensor, sin: Tensor, mask: Tensor | None
+    ) -> Tensor:
         x = x + self.self_attn(self.input_layernorm(x), cos, sin, mask)
         x = x + self.mlp(self.post_attention_layernorm(x))
 
         return x
 
 
-def build_causal_mask(attention_mask: Tensor | None, t: int, dtype: torch.dtype, device: torch.device) -> Tensor:
+def build_causal_mask(
+    attention_mask: Tensor | None, t: int, dtype: torch.dtype, device: torch.device
+) -> Tensor:
     minimum = torch.finfo(dtype).min
     positions = torch.arange(t, device=device)
     mask = torch.where(positions[None, :] > positions[:, None], minimum, 0.0).to(dtype)
-    mask = mask[None, None].expand(1 if attention_mask is None else attention_mask.shape[0], 1, t, t)
+    mask = mask[None, None].expand(
+        1 if attention_mask is None else attention_mask.shape[0], 1, t, t
+    )
 
     if attention_mask is not None:
         padding = torch.where(attention_mask.bool(), 0.0, minimum).to(dtype)
@@ -180,36 +213,67 @@ class LlamaModel(nn.Module):
 
         self.cfg = cfg
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.model_dim)
-        self.layers = nn.ModuleList(LlamaDecoderLayer(cfg) for _ in range(cfg.num_layers))
+        self.layers = nn.ModuleList(
+            LlamaDecoderLayer(cfg) for _ in range(cfg.num_layers)
+        )
         self.norm = LlamaRMSNorm(cfg.model_dim, cfg.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(cfg)
 
-    def forward(
+    def forward_embeddings(
         self,
-        input_ids: Tensor | None = None,
-        attention_mask: Tensor | None = None,
-        position_ids: Tensor | None = None,
-        inputs_embeds: Tensor | None = None,
+        input_embeds: torch.Tensor,
+        lengths: Tensor | None = None,
     ) -> Tensor:
-        if (input_ids is None) == (inputs_embeds is None):
-            raise ValueError("pass exactly one of input_ids or inputs_embeds")
+        b, t, _ = input_embeds.shape
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+        if lengths is not None:
+            assert lengths.shape == (b,)
 
-        b, t, _ = inputs_embeds.shape
+        minimum = torch.finfo(input_embeds.dtype).min
 
-        if position_ids is None:
-            position_ids = torch.arange(t, device=inputs_embeds.device).expand(b, t)
+        position_ids = torch.arange(0, t, dtype=torch.long).to(input_embeds.device)
+        cos, sin = self.rotary_emb(input_embeds, position_ids.unsqueeze(0))
 
-        cos, sin = self.rotary_emb(inputs_embeds, position_ids)
-        mask = build_causal_mask(attention_mask, t, inputs_embeds.dtype, inputs_embeds.device)
+        causal_mask = (
+            torch.where((position_ids[None, :] > position_ids[:, None]), minimum, 0)
+            .unsqueeze(0)
+            .expand(b, -1, -1)
+        )  # b, t, t
 
-        x = inputs_embeds
+        if lengths is not None:
+            causal_mask = causal_mask.where(
+                (lengths[:, None] > position_ids[None, :]).unsqueeze(1), minimum
+            )
+
+        causal_mask = causal_mask.unsqueeze(1)
+        x = input_embeds
         for layer in self.layers:
-            x = layer(x, cos, sin, mask)
+            x = layer(x, cos, sin, causal_mask)
 
         return self.norm(x)
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        lengths: Tensor | None = None,
+    ) -> Tensor:
+
+        input_embeds: Tensor = self.embed_tokens(input_ids)
+        return self.forward_embeddings(input_embeds, lengths)
+
+    @staticmethod
+    def from_pretrained(model_id: str, cfg: ModelConfig) -> "LlamaModel":
+        from transformers import AutoModelForCausalLM
+
+        hf_model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=cfg.dtype)
+
+        model = LlamaModel(cfg)
+        model.load_state_dict(
+            hf_model.model.state_dict(),
+            strict=False,
+        )
+
+        return model
 
 
 class LlamaForCausalLM(nn.Module):
@@ -234,12 +298,10 @@ class LlamaForCausalLM(nn.Module):
 
     def forward(
         self,
-        input_ids: Tensor | None = None,
-        attention_mask: Tensor | None = None,
-        position_ids: Tensor | None = None,
-        inputs_embeds: Tensor | None = None,
+        input_ids: Tensor,
+        lengths: Tensor | None = None,
     ) -> Tensor:
-        hidden = self.model(input_ids, attention_mask, position_ids, inputs_embeds)
+        hidden = self.model(input_ids, lengths)
 
         return self.lm_head(hidden)
 
@@ -253,7 +315,9 @@ def fetch_hf_state(model_id: str, revision: str = "main") -> dict[str, Tensor]:
     return {k: v.to(torch.float32) for k, v in state.items()}
 
 
-def load_hf_weights(model: LlamaForCausalLM, model_id: str, revision: str = "main") -> LlamaForCausalLM:
+def load_hf_weights(
+    model: LlamaForCausalLM, model_id: str, revision: str = "main"
+) -> LlamaForCausalLM:
     state = fetch_hf_state(model_id, revision)
 
     if model.cfg.tie_word_embeddings:

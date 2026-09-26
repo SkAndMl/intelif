@@ -36,6 +36,11 @@ def batch(tokenizer):
     return tokenizer(PROMPTS, return_tensors="pt", padding=True)
 
 
+@pytest.fixture(scope="module")
+def lengths(batch):
+    return batch["attention_mask"].sum(dim=1)
+
+
 def test_config_matches_checkpoint():
     hf = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=torch.float32).config
     cfg = ModelConfig()
@@ -63,7 +68,7 @@ def test_weights_are_tied(ours):
 
 
 @torch.no_grad()
-def test_hidden_states_match_layer_by_layer(reference, ours, batch):
+def test_hidden_states_match_layer_by_layer(reference, ours, batch, lengths):
     captured = []
     handles = [
         layer.register_forward_hook(lambda _m, _i, out: captured.append(out))
@@ -71,7 +76,7 @@ def test_hidden_states_match_layer_by_layer(reference, ours, batch):
     ]
 
     try:
-        final = ours.model(**batch)
+        final = ours.model(input_ids=batch["input_ids"], lengths=lengths)
     finally:
         for handle in handles:
             handle.remove()
@@ -91,8 +96,8 @@ def test_hidden_states_match_layer_by_layer(reference, ours, batch):
 
 
 @torch.no_grad()
-def test_logits_match(reference, ours, batch):
-    mine = ours(**batch)
+def test_logits_match(reference, ours, batch, lengths):
+    mine = ours(input_ids=batch["input_ids"], lengths=lengths)
     theirs = reference(**batch).logits
     keep = batch["attention_mask"].bool()
 
@@ -125,32 +130,12 @@ def test_greedy_continuation_matches(reference, ours, tokenizer):
 
 
 @torch.no_grad()
-def test_inputs_embeds_path_matches_input_ids(ours, batch):
-    embeds = ours.model.embed_tokens(batch["input_ids"])
-
-    from_ids = ours(**batch)
-    from_embeds = ours(inputs_embeds=embeds, attention_mask=batch["attention_mask"])
-
-    assert torch.equal(from_ids, from_embeds)
-
-
-@torch.no_grad()
 def test_padding_does_not_change_unpadded_logits(ours, tokenizer):
     ids = tokenizer(PROMPTS[0], return_tensors="pt")["input_ids"]
     padded = torch.cat([ids, torch.full((1, 7), tokenizer.pad_token_id)], dim=-1)
-    mask = torch.cat([torch.ones_like(ids), torch.zeros(1, 7, dtype=torch.long)], dim=-1)
+    lengths = torch.tensor([ids.shape[1]])
 
     unpadded_logits = ours(input_ids=ids)
-    padded_logits = ours(input_ids=padded, attention_mask=mask)[:, : ids.shape[1]]
+    padded_logits = ours(input_ids=padded, lengths=lengths)[:, : ids.shape[1]]
 
     assert torch.allclose(unpadded_logits, padded_logits, atol=1e-4)
-
-
-def test_rejects_both_input_ids_and_embeds(ours, batch):
-    with pytest.raises(ValueError):
-        ours(input_ids=batch["input_ids"], inputs_embeds=ours.model.embed_tokens(batch["input_ids"]))
-
-
-def test_rejects_neither_input(ours):
-    with pytest.raises(ValueError):
-        ours()
