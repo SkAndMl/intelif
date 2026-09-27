@@ -265,7 +265,7 @@ class LlamaModel(nn.Module):
     def from_pretrained(model_id: str, cfg: ModelConfig) -> "LlamaModel":
         from transformers import AutoModelForCausalLM
 
-        hf_model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=cfg.dtype)
+        hf_model = AutoModelForCausalLM.from_pretrained(model_id, dtype=cfg.dtype)
 
         model = LlamaModel(cfg)
         model.load_state_dict(

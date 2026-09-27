@@ -2,8 +2,10 @@ from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 from llama import LlamaModel, ModelConfig
+from lora import LoraConfig, inject_lora
 
 MODEL_ID = "HuggingFaceTB/SmolLM2-360M-Instruct"
 
@@ -22,6 +24,8 @@ class IntelIfConfig:
     model_id: str
     choice_dim: int = 256
     temperature: float = 0.07
+    lora_config: LoraConfig | None = None
+    freeze_base: bool = True
 
 
 class IntelIf(nn.Module):
@@ -34,6 +38,16 @@ class IntelIf(nn.Module):
         self.base_model = LlamaModel.from_pretrained(
             model_id=cfg.model_id, cfg=base_model_cfg
         )
+
+        if self.cfg.freeze_base:
+            self.base_model.requires_grad_(False)
+
+        if self.cfg.lora_config is not None:
+            inject_lora(
+                self.base_model,
+                self.cfg.lora_config,
+            )
+
         self.model_to_choice = nn.Linear(
             in_features=self.base_model_cfg.model_dim,
             out_features=self.cfg.choice_dim,
@@ -81,6 +95,7 @@ class IntelIf(nn.Module):
         ]
 
         choice_state: Tensor = self.model_to_choice(decision_state)  # b, choice_dim
+        choice_state = F.normalize(choice_state, dim=-1)
 
         choice_logits = choice_state.float() @ choice_embeddings.transpose(
             0, 1
