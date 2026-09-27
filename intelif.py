@@ -2,7 +2,6 @@ from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
-from torch.nn import functional as F
 
 from llama import LlamaModel, ModelConfig
 from lora import LoraConfig, inject_lora
@@ -48,14 +47,9 @@ class IntelIf(nn.Module):
                 self.cfg.lora_config,
             )
 
-        self.model_to_choice = nn.Linear(
+        self.scorer = nn.Linear(
             in_features=self.base_model_cfg.model_dim,
-            out_features=self.cfg.choice_dim,
-            bias=False,
-        )
-        self.choice_to_model = nn.Linear(
-            in_features=self.cfg.choice_dim,
-            out_features=self.base_model_cfg.model_dim,
+            out_features=1,
             bias=False,
         )
 
@@ -71,34 +65,18 @@ class IntelIf(nn.Module):
 
         b = lengths.shape[0]
 
-        text_embeds: Tensor = self.base_model.embed_tokens(input_ids)  # b, t, model_dim
+        input_embeds: Tensor = self.base_model.embed_tokens(input_ids)
 
-        choice_embeddings = create_orthogonal_tensors(
-            num_choices, self.cfg.choice_dim
-        ).to(input_ids.device)  # num_choices, choice_dim
+        last_hidden_state = self.base_model.forward_embeddings(
+            input_embeds, lengths
+        )  # b, t, model_dim
 
-        choice_model_proj: Tensor = self.choice_to_model(
-            choice_embeddings.to(text_embeds.dtype)
-        )  # num_choices, model_dim
+        mask = choice_slots >= 0
+        assert (mask.sum(dim=1) == num_choices).all()
 
-        choice_proj_per_position = choice_model_proj[
-            choice_slots.clamp(min=0)
-        ]  # b, t, model_dim
-
-        input_embeds = torch.where(
-            choice_slots[..., None] >= 0, choice_proj_per_position, text_embeds
+        score_states = last_hidden_state[mask].view(
+            b, num_choices, self.base_model_cfg.model_dim
         )
+        scores: Tensor = self.scorer(score_states)
 
-        last_hidden_state = self.base_model.forward_embeddings(input_embeds, lengths)
-        decision_state = last_hidden_state[
-            torch.arange(b, device=lengths.device), lengths - 1
-        ]
-
-        choice_state: Tensor = self.model_to_choice(decision_state)  # b, choice_dim
-        choice_state = F.normalize(choice_state, dim=-1)
-
-        choice_logits = choice_state.float() @ choice_embeddings.transpose(
-            0, 1
-        )  # b, num_choices
-
-        return choice_logits / self.cfg.temperature
+        return scores.squeeze(-1)
