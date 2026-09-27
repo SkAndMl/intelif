@@ -13,7 +13,7 @@ from llama import ModelConfig
 from lora import LoraConfig
 
 MODEL_ID = "HuggingFaceTB/SmolLM2-360M-Instruct"
-batch_size = 16
+batch_size = 8
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 print(f"running on {device}")
@@ -159,17 +159,17 @@ def eval_score(split: Literal["val", "test"]) -> tuple[torch.Tensor, float]:
     model.eval()
     total_loss, total_correct, total_examples = 0, 0, 0
     for batch in get_data(split):
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             logits: torch.Tensor = model(
                 input_ids=batch["input_ids"],
                 lengths=batch["lengths"],
                 choice_slots=batch["choice_slots"],
                 num_choices=len(CHOICES),
             )
+            total_loss += torch.nn.functional.cross_entropy(
+                logits, target=batch["targets"], reduction="sum"
+            )
 
-        total_loss += torch.nn.functional.cross_entropy(
-            logits, target=batch["targets"], reduction="sum"
-        )
         total_correct += (
             (logits.argmax(dim=-1) == batch["targets"]).float().sum().item()
         )
@@ -234,15 +234,16 @@ for epoch in range(epochs):
         step += 1
 
         optimizer.zero_grad()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits = model(
+                input_ids=batch["input_ids"],
+                lengths=batch["lengths"],
+                choice_slots=batch["choice_slots"],
+                num_choices=len(CHOICES),
+            )
 
-        logits = model(
-            input_ids=batch["input_ids"],
-            lengths=batch["lengths"],
-            choice_slots=batch["choice_slots"],
-            num_choices=len(CHOICES),
-        )
+            loss = torch.nn.functional.cross_entropy(logits, target=batch["targets"])
 
-        loss = torch.nn.functional.cross_entropy(logits, target=batch["targets"])
         loss.backward()
 
         scorer_grad_norm = model.scorer.weight.grad.norm().item()
@@ -279,6 +280,6 @@ for epoch in range(epochs):
 
     test_loss, test_accuracy = eval_score("test")
     print(
-        f"[epoch={epoch + 1}/epochs] "
+        f"[epoch={epoch + 1}/{epochs}] "
         f"test loss: {test_loss.item():.4f}, test accuracy: {test_accuracy:.4f}"
     )

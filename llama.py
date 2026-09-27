@@ -143,13 +143,16 @@ class LlamaAttention(nn.Module):
         k = repeat_kv(k, self.cfg.num_kv_groups)
         v = repeat_kv(v, self.cfg.num_kv_groups)
 
-        weights = (q @ k.transpose(2, 3)) * self.scaling
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=mask,
+            dropout_p=0.0,
+            is_causal=False,
+        )
 
-        if mask is not None:
-            weights = weights + mask
-
-        weights = weights.softmax(dim=-1, dtype=torch.float32).to(q.dtype)
-        out = (weights @ v).transpose(1, 2).reshape(b, t, -1)
+        out = out.transpose(1, 2).reshape(b, t, -1)
 
         return self.o_proj(out)
 
