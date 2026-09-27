@@ -3,10 +3,10 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 
-from llama import LlamaModel, ModelConfig
 from lora import LoraConfig, inject_lora
+from qwen import ModelConfig, Qwen3Model
 
-MODEL_ID = "HuggingFaceTB/SmolLM2-360M-Instruct"
+MODEL_ID = "Qwen/Qwen3-4B"
 
 
 def create_orthogonal_tensors(choices: int, dim: int) -> torch.Tensor:
@@ -34,7 +34,7 @@ class IntelIf(nn.Module):
         self.cfg = cfg
         self.base_model_cfg = base_model_cfg
 
-        self.base_model = LlamaModel.from_pretrained(
+        self.base_model = Qwen3Model.from_pretrained(
             model_id=cfg.model_id, cfg=base_model_cfg
         )
 

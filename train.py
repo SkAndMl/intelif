@@ -1,3 +1,4 @@
+import math
 from collections import deque
 from random import Random
 
@@ -5,12 +6,12 @@ import torch
 from transformers import AutoTokenizer
 
 from data import load_intent_data, make_batches
-from intelif import IntelIf, IntelIfConfig
-from llama import ModelConfig
+from intelif import MODEL_ID, IntelIf, IntelIfConfig
 from lora import LoraConfig
+from qwen import ModelConfig
 
-MODEL_ID = "HuggingFaceTB/SmolLM2-360M-Instruct"
-batch_size = 8
+batch_size = 4
+max_tokens = 8192
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 print(f"running on {device}")
@@ -39,6 +40,7 @@ def get_batches(
         choices=data["choices"],
         tokenizer=tokenizer,
         batch_size=batch_size,
+        max_tokens=max_tokens,
         device=device,
         rng=rng,
         shuffle=shuffle,
@@ -78,6 +80,8 @@ epochs = 5
 log_every = 300
 rolling_window = 30
 max_grad_norm = 1.0
+grad_accum_steps = 8
+warmup_ratio = 0.05
 
 trainable_params = [
     parameter for parameter in model.parameters() if parameter.requires_grad
@@ -112,19 +116,34 @@ optimizer = torch.optim.AdamW(
     lr=3e-4,
 )
 
+batches_per_epoch = sum(1 for _ in get_batches(data["train"], Random(0), shuffle=True))
+total_steps = epochs * batches_per_epoch // grad_accum_steps
+warmup_steps = max(1, int(warmup_ratio * total_steps))
+
+
+def lr_lambda(step: int) -> float:
+    if step < warmup_steps:
+        return (step + 1) / warmup_steps
+
+    progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
+    return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
 recent_losses = deque(maxlen=rolling_window)
 recent_accuracies = deque(maxlen=rolling_window)
 
 print(f"Training {len(lora_a_params)} LoRA adapters with full choice catalogs")
 
 step = 0
+micro_step = 0
 best_val_loss = float("inf")
 
 for epoch in range(epochs):
     for batch in get_batches(data["train"], train_rng, shuffle=True):
-        step += 1
+        micro_step += 1
 
-        optimizer.zero_grad()
         with torch.autocast(
             device_type="cuda", dtype=torch.bfloat16, enabled=device == "cuda"
         ):
@@ -137,7 +156,16 @@ for epoch in range(epochs):
 
             loss = torch.nn.functional.cross_entropy(logits, target=batch["targets"])
 
-        loss.backward()
+        (loss / grad_accum_steps).backward()
+
+        accuracy = (logits.argmax(dim=-1) == batch["targets"]).float().mean().item()
+        recent_losses.append(loss.item())
+        recent_accuracies.append(accuracy)
+
+        if micro_step % grad_accum_steps != 0:
+            continue
+
+        step += 1
 
         scorer_grad_norm = model.scorer.weight.grad.norm().item()
         lora_a_grad_norm = gradient_norm(lora_a_params)
@@ -150,14 +178,13 @@ for epoch in range(epochs):
         ).item()
 
         optimizer.step()
-
-        accuracy = (logits.argmax(dim=-1) == batch["targets"]).float().mean().item()
-        recent_losses.append(loss.item())
-        recent_accuracies.append(accuracy)
+        scheduler.step()
+        optimizer.zero_grad()
 
         if step == 1 or step % log_every == 0:
             print(
                 f"[epoch={epoch + 1}/{epochs}, step={step}] "
+                f"lr: {scheduler.get_last_lr()[0]:.2e}, "
                 f"train loss: {loss.item():.4f}, train accuracy: {accuracy:.4f}, "
                 f"rolling_loss: {sum(recent_losses) / len(recent_losses):.4f}, "
                 f"rolling_accuracy: {sum(recent_accuracies) / len(recent_accuracies):.4f}, "

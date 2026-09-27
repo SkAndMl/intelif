@@ -1,16 +1,23 @@
+import json
+import re
 from collections.abc import Iterator
 from random import Random
 
 import torch
 from datasets import load_dataset
+from dotenv import find_dotenv, load_dotenv
 from sklearn.model_selection import train_test_split
 from torch import Tensor
 from transformers import PreTrainedTokenizerBase
+
+load_dotenv(find_dotenv())
 
 DATASET_REVISIONS = {
     "mteb/banking77": "18072d2685ea682290f7b8924d94c62acc19c0b2",
     "SetFit/amazon_massive_intent_en-US": "f7672a018e8ceb37fc0184dcfbb7e665155ffea6",
     "DeepPavlov/clinc150": "d835118ecd5ffe5488d22e9e58d1c23d18c33229",
+    "Salesforce/xlam-function-calling-60k": "26d14ebfe18b1f7b524bd39b404b50af5dc97866",
+    "osunlp/early-experience": "7f1dfbe4f7a100ee1337843b1abbd2c25b8cf7ce",
 }
 
 # Chosen once with random.Random(42).sample(sorted(BANKING77 labels), 20).
@@ -41,10 +48,95 @@ HELD_OUT_BANKING_INTENTS = frozenset(
 )
 
 QUESTION = "What is the intent?"
+TOOL_QUESTION = "Which tool should be called?"
+ACTION_QUESTION = "Which action should the agent take next?"
+
+ACTIONS_MARKER = "Your admissible actions of the current situation are:"
+ACTION_PATTERN = re.compile(r"^\s*\[?(['\"])(.*)\1\]?[,.]*\s*$", re.MULTILINE)
+MAX_STATE_CHARS = 4000
+MAX_ACTION_CHOICES = 64
 
 
 def readable_intent(name: str) -> str:
     return name.replace("_", " ")
+
+
+def xlam_rows(xlam) -> list[dict]:
+    rows = []
+
+    for row in xlam:
+        tools = json.loads(row["tools"])
+        names = [tool["name"] for tool in tools]
+        called = {call["name"] for call in json.loads(row["answers"])}
+
+        if len(called) != 1 or not called < set(names) or len(set(names)) != len(names):
+            continue
+
+        choices = [f"{tool['name']}: {tool.get('description', '')}" for tool in tools]
+
+        rows.append(
+            {
+                "state": row["query"],
+                "source": "xlam",
+                "question": TOOL_QUESTION,
+                "choices": choices,
+                "gold_intent": choices[names.index(called.pop())],
+                "group": row["id"],
+            }
+        )
+
+    return rows
+
+
+def agent_rows(dataset, source: str) -> list[dict]:
+    rows, seen = [], set()
+
+    for row in dataset:
+        prompt = row["messages"][-2]["content"]
+        state, listing = prompt.split(ACTIONS_MARKER)
+        listing = listing.split("Now it's your turn")[0]
+
+        actions = [action for _, action in ACTION_PATTERN.findall(listing)]
+        answer = row["messages"][-1]["content"]
+        gold = re.search(r"<action>(.*?)</action>", answer, re.DOTALL).group(1).strip()
+
+        if (
+            prompt in seen
+            or gold not in actions
+            or len(set(actions)) != len(actions)
+            or len(actions) > MAX_ACTION_CHOICES
+            or len(state) > MAX_STATE_CHARS
+        ):
+            continue
+
+        seen.add(prompt)
+        rows.append(
+            {
+                "state": state.strip(),
+                "source": source,
+                "question": ACTION_QUESTION,
+                "choices": actions,
+                "gold_intent": gold,
+                "group": re.search(r"Your task is to: (.*)", state).group(1),
+            }
+        )
+
+    return rows
+
+
+def split_by_group(rows: list[dict], seed: int) -> tuple[list, list, list]:
+    groups = sorted({row["group"] for row in rows})
+    train_groups, held_out = train_test_split(groups, test_size=0.1, random_state=seed)
+
+    train_groups = set(train_groups)
+    val_groups = set(held_out[: len(held_out) // 2])
+    test_groups = set(held_out[len(held_out) // 2 :])
+
+    return (
+        [row for row in rows if row["group"] in train_groups],
+        [row for row in rows if row["group"] in val_groups],
+        [row for row in rows if row["group"] in test_groups],
+    )
 
 
 def banking_test_rows(banking, held_out: bool) -> list[dict[str, str]]:
@@ -88,6 +180,27 @@ def load_intent_data(seed: int = 42) -> dict:
         revision=DATASET_REVISIONS["DeepPavlov/clinc150"],
     )["intents"]
 
+    xlam = load_dataset(
+        "json",
+        data_files="hf://datasets/Salesforce/xlam-function-calling-60k"
+        f"@{DATASET_REVISIONS['Salesforce/xlam-function-calling-60k']}"
+        "/xlam_function_calling_60k.json",
+        split="train",
+    )
+    alfworld = load_dataset(
+        "osunlp/early-experience",
+        "alfworld",
+        split="expert",
+        revision=DATASET_REVISIONS["osunlp/early-experience"],
+    )
+    webshop = load_dataset(
+        "json",
+        data_files="hf://datasets/osunlp/early-experience"
+        f"@{DATASET_REVISIONS['osunlp/early-experience']}"
+        "/webshop/expert_sft.jsonl",
+        split="train",
+    )
+
     banking_names = set(banking["train"].unique("label_text"))
     if len(banking_names) != 77 or not HELD_OUT_BANKING_INTENTS < banking_names:
         raise ValueError("BANKING77 labels changed; review the held-out intent list")
@@ -129,27 +242,107 @@ def load_intent_data(seed: int = 42) -> dict:
         if row["label"] is not None
     ]
 
+    xlam_train, xlam_val, xlam_test = split_by_group(xlam_rows(xlam), seed)
+    alfworld_train, alfworld_val, alfworld_test = split_by_group(
+        agent_rows(alfworld, "alfworld"), seed
+    )
+    webshop_train, webshop_val, webshop_test = split_by_group(
+        agent_rows(webshop, "webshop"), seed
+    )
+
     return {
-        "train": banking_train + massive_rows(massive, "train"),
+        "train": banking_train
+        + massive_rows(massive, "train")
+        + xlam_train
+        + alfworld_train
+        + webshop_train,
         "validation": {
             "banking77": banking_val,
             "massive": massive_rows(massive, "validation"),
+            "xlam": xlam_val,
+            "alfworld": alfworld_val,
+            "webshop": webshop_val,
         },
         "final": {
             "banking77_seen": banking_test_rows(banking, False),
             "banking77_held_out": banking_test_rows(banking, True),
             "massive": massive_rows(massive, "test"),
             "clinc150": clinc_test,
+            "xlam": xlam_test,
+            "alfworld": alfworld_test,
+            "webshop": webshop_test,
         },
         "choices": choices,
     }
 
 
-def construct_input_text(state: str, choices: list[str], anchor_token: str) -> str:
-    text = f"STATE:\n{state}\nQUESTION:\n{QUESTION}\nCHOICES:\n"
+def construct_input_text(
+    state: str, question: str, choices: list[str], anchor_token: str
+) -> str:
+    text = f"STATE:\n{state}\nQUESTION:\n{question}\nCHOICES:\n"
     for choice in choices:
         text += f"{readable_intent(choice)} {anchor_token}\n"
     return text + "DECISION:"
+
+
+def encode_row(
+    row: dict,
+    choices: dict[str, list[str]],
+    tokenizer: PreTrainedTokenizerBase,
+    rng: Random,
+) -> dict:
+    catalog = row.get("choices") or choices[row.get("choice_pool", row["source"])]
+
+    if row["gold_intent"] not in catalog:
+        raise ValueError(f"Unknown intent: {row['source']}/{row['gold_intent']}")
+
+    candidates = catalog.copy()
+    rng.shuffle(candidates)
+
+    text = construct_input_text(
+        row["state"],
+        row.get("question", QUESTION),
+        candidates,
+        tokenizer.pad_token,
+    )
+    ids = torch.tensor(tokenizer.encode(text), dtype=torch.long)
+
+    anchor_mask = ids == tokenizer.pad_token_id
+    if anchor_mask.sum().item() != len(candidates):
+        raise ValueError("Expected one choice anchor per candidate")
+
+    slots = torch.full_like(ids, -1)
+    slots[anchor_mask] = torch.arange(len(candidates))
+
+    return {
+        "input_ids": ids,
+        "choice_slots": slots,
+        "target": candidates.index(row["gold_intent"]),
+        "choice_count": len(candidates),
+    }
+
+
+def collate_batch(batch: list[dict], pad_token_id: int, device: str) -> dict[str, Tensor]:
+    lengths = [len(example["input_ids"]) for example in batch]
+    max_len = max(lengths)
+    max_choices = max(example["choice_count"] for example in batch)
+
+    padded_ids = torch.full((len(batch), max_len), pad_token_id, dtype=torch.long)
+    padded_slots = torch.full((len(batch), max_len), -1, dtype=torch.long)
+    choice_mask = torch.zeros((len(batch), max_choices), dtype=torch.bool)
+
+    for i, example in enumerate(batch):
+        padded_ids[i, : lengths[i]] = example["input_ids"]
+        padded_slots[i, : lengths[i]] = example["choice_slots"]
+        choice_mask[i, : example["choice_count"]] = True
+
+    return {
+        "input_ids": padded_ids.to(device),
+        "choice_slots": padded_slots.to(device),
+        "choice_mask": choice_mask.to(device),
+        "lengths": torch.tensor(lengths, device=device),
+        "targets": torch.tensor([example["target"] for example in batch], device=device),
+    }
 
 
 def make_batches(
@@ -157,6 +350,7 @@ def make_batches(
     choices: dict[str, list[str]],
     tokenizer: PreTrainedTokenizerBase,
     batch_size: int,
+    max_tokens: int,
     device: str,
     rng: Random,
     shuffle: bool = False,
@@ -169,55 +363,21 @@ def make_batches(
     if shuffle:
         rng.shuffle(rows)
 
-    for start in range(0, len(rows), batch_size):
-        batch = rows[start : start + batch_size]
-        input_ids, choice_slots = [], []
-        lengths, targets, choice_counts = [], [], []
+    batch, longest = [], 0
 
-        for row in batch:
-            catalog = choices[row.get("choice_pool", row["source"])]
+    for row in rows:
+        example = encode_row(row, choices, tokenizer, rng)
+        length = len(example["input_ids"])
 
-            if row["gold_intent"] not in catalog:
-                raise ValueError(f"Unknown intent: {row['source']}/{row['gold_intent']}")
+        if batch and (
+            len(batch) == batch_size
+            or max(longest, length) * (len(batch) + 1) > max_tokens
+        ):
+            yield collate_batch(batch, tokenizer.pad_token_id, device)
+            batch, longest = [], 0
 
-            candidates = catalog.copy()
-            rng.shuffle(candidates)
+        batch.append(example)
+        longest = max(longest, length)
 
-            targets.append(candidates.index(row["gold_intent"]))
-            choice_counts.append(len(candidates))
-
-            text = construct_input_text(row["state"], candidates, tokenizer.pad_token)
-            ids = torch.tensor(tokenizer.encode(text), dtype=torch.long)
-
-            anchor_mask = ids == tokenizer.pad_token_id
-            if anchor_mask.sum().item() != len(candidates):
-                raise ValueError("Expected one choice anchor per candidate")
-
-            slots = torch.full_like(ids, -1)
-            slots[anchor_mask] = torch.arange(len(candidates))
-
-            input_ids.append(ids)
-            choice_slots.append(slots)
-            lengths.append(len(ids))
-
-        max_len = max(lengths)
-        max_choices = max(choice_counts)
-
-        padded_ids = torch.full(
-            (len(batch), max_len), tokenizer.pad_token_id, dtype=torch.long
-        )
-        padded_slots = torch.full((len(batch), max_len), -1, dtype=torch.long)
-        choice_mask = torch.zeros((len(batch), max_choices), dtype=torch.bool)
-
-        for i, (ids, slots) in enumerate(zip(input_ids, choice_slots)):
-            padded_ids[i, : lengths[i]] = ids
-            padded_slots[i, : lengths[i]] = slots
-            choice_mask[i, : choice_counts[i]] = True
-
-        yield {
-            "input_ids": padded_ids.to(device),
-            "choice_slots": padded_slots.to(device),
-            "choice_mask": choice_mask.to(device),
-            "lengths": torch.tensor(lengths, device=device),
-            "targets": torch.tensor(targets, device=device),
-        }
+    if batch:
+        yield collate_batch(batch, tokenizer.pad_token_id, device)
