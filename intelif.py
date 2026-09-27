@@ -58,12 +58,11 @@ class IntelIf(nn.Module):
         input_ids: Tensor,
         lengths: Tensor,
         choice_slots: Tensor,
-        num_choices: int,
+        choice_mask: Tensor,
     ) -> Tensor:
 
         assert choice_slots.shape == input_ids.shape
-
-        b = lengths.shape[0]
+        assert choice_mask.shape[0] == input_ids.shape[0]
 
         input_embeds: Tensor = self.base_model.embed_tokens(input_ids)
 
@@ -72,11 +71,16 @@ class IntelIf(nn.Module):
         )  # b, t, model_dim
 
         mask = choice_slots >= 0
-        assert (mask.sum(dim=1) == num_choices).all()
+        assert (mask.sum(dim=1) == choice_mask.sum(dim=1)).all()
 
-        score_states = last_hidden_state[mask].view(
-            b, num_choices, self.base_model_cfg.model_dim
-        )
-        scores: Tensor = self.scorer(score_states)
+        batch_indices, token_indices = mask.nonzero(as_tuple=True)
+        slot_indices = choice_slots[batch_indices, token_indices]
+        assert choice_mask[batch_indices, slot_indices].all()
 
-        return scores.squeeze(-1)
+        score_states = last_hidden_state[batch_indices, token_indices]
+        scores: Tensor = self.scorer(score_states).squeeze(-1)
+
+        logits = scores.new_full(choice_mask.shape, float("-inf"))
+        logits[batch_indices, slot_indices] = scores
+
+        return logits
