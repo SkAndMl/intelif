@@ -23,6 +23,7 @@ class ModelConfig:
     mlp_bias: bool = False
     context_length: int = 40960
     dtype: torch.dtype = torch.bfloat16
+    gradient_checkpointing: bool = True
 
     def __post_init__(self):
         assert self.num_heads % self.num_kv_heads == 0
@@ -204,7 +205,11 @@ class Qwen3Model(nn.Module):
 
         x = input_embeds
         for layer in self.layers:
-            if self.training and torch.is_grad_enabled():
+            if (
+                self.cfg.gradient_checkpointing
+                and self.training
+                and torch.is_grad_enabled()
+            ):
                 x = checkpoint(layer, x, cos, sin, use_reentrant=False)
             else:
                 x = layer(x, cos, sin)

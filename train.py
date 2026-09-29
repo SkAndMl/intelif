@@ -1,30 +1,46 @@
+import json
 import math
-from collections import deque
+import time
+from collections import Counter, deque
 from random import Random
 
 import torch
+from safetensors.torch import load_file, save_file
 from transformers import AutoTokenizer
 
-from data import load_intent_data, make_batches
+from data import DATASET_REVISIONS, load_intent_data, make_batches
+from hf import ADAPTER_PATH, LOG_PATH, RESULTS_PATH, upload_run
 from intelif import MODEL_ID, IntelIf, IntelIfConfig
 from lora import LoraConfig
 from qwen import ModelConfig
 
-batch_size = 4
-max_tokens = 8192
+batch_size = 32
+max_tokens = 16384
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-print(f"running on {device}")
+open(LOG_PATH, "w").close()
+
+
+def log(message: str) -> None:
+    print(message)
+    with open(LOG_PATH, "a") as file:
+        file.write(message + "\n")
+
+
+log(f"running on {device}")
 
 data = load_intent_data()
 train_rng = Random(42)
 
+lora_config = LoraConfig()
+base_model_cfg = ModelConfig()
+
 model = IntelIf(
     cfg=IntelIfConfig(
         model_id=MODEL_ID,
-        lora_config=LoraConfig(),
+        lora_config=lora_config,
     ),
-    base_model_cfg=ModelConfig(),
+    base_model_cfg=base_model_cfg,
 ).to(device)
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
@@ -76,12 +92,13 @@ def eval_score(examples: list[dict[str, str]]) -> tuple[torch.Tensor, float]:
     return total_loss / total_examples, total_correct / total_examples
 
 
-epochs = 5
-log_every = 300
+epochs = 2
+log_every = 200
 rolling_window = 30
 max_grad_norm = 1.0
-grad_accum_steps = 8
+grad_accum_steps = 2
 warmup_ratio = 0.05
+learning_rate = 3e-4
 
 trainable_params = [
     parameter for parameter in model.parameters() if parameter.requires_grad
@@ -111,9 +128,25 @@ def gradient_norm(parameters: list[torch.nn.Parameter]) -> float:
     ).item()
 
 
+trainable_names = {
+    name for name, parameter in model.named_parameters() if parameter.requires_grad
+}
+
+
+def save_adapter() -> None:
+    save_file(
+        {
+            name: tensor.detach().cpu()
+            for name, tensor in model.state_dict().items()
+            if name in trainable_names
+        },
+        ADAPTER_PATH,
+    )
+
+
 optimizer = torch.optim.AdamW(
     params=trainable_params,
-    lr=3e-4,
+    lr=learning_rate,
 )
 
 batches_per_epoch = sum(1 for _ in get_batches(data["train"], Random(0), shuffle=True))
@@ -134,11 +167,37 @@ scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 recent_losses = deque(maxlen=rolling_window)
 recent_accuracies = deque(maxlen=rolling_window)
 
-print(f"Training {len(lora_a_params)} LoRA adapters with full choice catalogs")
+hyperparams = {
+    "model_id": MODEL_ID,
+    "lora_r": lora_config.r,
+    "lora_alpha": lora_config.lora_alpha,
+    "lora_dropout": lora_config.lora_dropout,
+    "lora_target_modules": list(lora_config.target_modules),
+    "base_dtype": str(base_model_cfg.dtype),
+    "gradient_checkpointing": base_model_cfg.gradient_checkpointing,
+    "epochs": epochs,
+    "batch_size": batch_size,
+    "max_tokens": max_tokens,
+    "grad_accum_steps": grad_accum_steps,
+    "learning_rate": learning_rate,
+    "warmup_ratio": warmup_ratio,
+    "warmup_steps": warmup_steps,
+    "total_steps": total_steps,
+    "max_grad_norm": max_grad_norm,
+    "seed": 42,
+    "dataset_revisions": DATASET_REVISIONS,
+}
+
+log(f"hyperparams: {json.dumps(hyperparams)}")
+log(f"Training {len(lora_a_params)} LoRA adapters with full choice catalogs")
 
 step = 0
 micro_step = 0
+window_rows = 0
+window_tokens = 0
+window_start = time.perf_counter()
 best_val_loss = float("inf")
+best = {}
 
 for epoch in range(epochs):
     for batch in get_batches(data["train"], train_rng, shuffle=True):
@@ -154,18 +213,31 @@ for epoch in range(epochs):
                 choice_mask=batch["choice_mask"],
             )
 
-            loss = torch.nn.functional.cross_entropy(logits, target=batch["targets"])
+            loss_sum = torch.nn.functional.cross_entropy(
+                logits, target=batch["targets"], reduction="sum"
+            )
 
-        (loss / grad_accum_steps).backward()
+        loss_sum.backward()
 
+        rows = batch["targets"].numel()
+        window_rows += rows
+        window_tokens += batch["input_ids"].numel()
+
+        loss = loss_sum.item() / rows
         accuracy = (logits.argmax(dim=-1) == batch["targets"]).float().mean().item()
-        recent_losses.append(loss.item())
+        recent_losses.append(loss)
         recent_accuracies.append(accuracy)
 
         if micro_step % grad_accum_steps != 0:
             continue
 
         step += 1
+
+        for parameter in trainable_params:
+            if parameter.grad is not None:
+                parameter.grad.div_(window_rows)
+
+        window_rows = 0
 
         scorer_grad_norm = model.scorer.weight.grad.norm().item()
         lora_a_grad_norm = gradient_norm(lora_a_params)
@@ -181,11 +253,18 @@ for epoch in range(epochs):
         scheduler.step()
         optimizer.zero_grad()
 
-        if step == 1 or step % log_every == 0:
-            print(
-                f"[epoch={epoch + 1}/{epochs}, step={step}] "
+        if step == 1 or step % log_every == 0 or step == total_steps:
+            elapsed = time.perf_counter() - window_start
+            peak_memory = (
+                torch.cuda.max_memory_allocated() / 2**30 if device == "cuda" else 0.0
+            )
+
+            log(
+                f"[epoch={epoch + 1}/{epochs}, step={step}/{total_steps}] "
                 f"lr: {scheduler.get_last_lr()[0]:.2e}, "
-                f"train loss: {loss.item():.4f}, train accuracy: {accuracy:.4f}, "
+                f"tokens/s: {window_tokens / elapsed:.0f}, "
+                f"peak_memory: {peak_memory:.1f}GiB, "
+                f"train loss: {loss:.4f}, train accuracy: {accuracy:.4f}, "
                 f"rolling_loss: {sum(recent_losses) / len(recent_losses):.4f}, "
                 f"rolling_accuracy: {sum(recent_accuracies) / len(recent_accuracies):.4f}, "
                 f"grad_norms (before clipping): "
@@ -196,23 +275,55 @@ for epoch in range(epochs):
             )
 
             total_val_loss = 0
+            validation = {}
 
             for name, examples in data["validation"].items():
                 val_loss, val_accuracy = eval_score(examples)
-                print(
+                log(
                     f"  validation/{name}: "
                     f"loss={val_loss.item():.4f}, accuracy={val_accuracy:.4f}"
                 )
 
                 total_val_loss += val_loss
+                validation[name] = {"loss": val_loss.item(), "accuracy": val_accuracy}
 
             if total_val_loss.item() < best_val_loss:
                 best_val_loss = total_val_loss.item()
-                torch.save(model.state_dict(), "best_model.pt")
+                best = {
+                    "step": step,
+                    "val_loss": best_val_loss,
+                    "validation": validation,
+                }
+                save_adapter()
+
+            window_tokens = 0
+            window_start = time.perf_counter()
 
 
-model.load_state_dict(torch.load("best_model.pt"))
+incompatible = model.load_state_dict(
+    load_file(ADAPTER_PATH, device=device), strict=False
+)
+if incompatible.unexpected_keys or set(incompatible.missing_keys) & trainable_names:
+    raise RuntimeError("The saved adapter does not match the model")
+
+final = {}
 
 for name, examples in data["final"].items():
     test_loss, test_accuracy = eval_score(examples)
-    print(f"final/{name}: loss={test_loss.item():.4f}, accuracy={test_accuracy:.4f}")
+    log(f"final/{name}: loss={test_loss.item():.4f}, accuracy={test_accuracy:.4f}")
+
+    final[name] = {"loss": test_loss.item(), "accuracy": test_accuracy}
+
+with open(RESULTS_PATH, "w") as file:
+    json.dump(
+        {
+            "hyperparams": hyperparams,
+            "best": best,
+            "final": final,
+            "train_rows": dict(Counter(row["source"] for row in data["train"])),
+        },
+        file,
+        indent=2,
+    )
+
+log(f"uploaded to {upload_run()}")

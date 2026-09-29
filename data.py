@@ -73,6 +73,7 @@ def xlam_rows(xlam) -> list[dict]:
             continue
 
         choices = [f"{tool['name']}: {tool.get('description', '')}" for tool in tools]
+        gold = called.pop()
 
         rows.append(
             {
@@ -80,8 +81,8 @@ def xlam_rows(xlam) -> list[dict]:
                 "source": "xlam",
                 "question": TOOL_QUESTION,
                 "choices": choices,
-                "gold_intent": choices[names.index(called.pop())],
-                "group": row["id"],
+                "gold_intent": choices[names.index(gold)],
+                "group": gold,
             }
         )
 
@@ -92,7 +93,7 @@ def agent_rows(dataset, source: str) -> list[dict]:
     rows, seen = [], set()
 
     for row in dataset:
-        prompt = row["messages"][-2]["content"]
+        prompt: str = row["messages"][-2]["content"]
         state, listing = prompt.split(ACTIONS_MARKER)
         listing = listing.split("Now it's your turn")[0]
 
@@ -322,7 +323,9 @@ def encode_row(
     }
 
 
-def collate_batch(batch: list[dict], pad_token_id: int, device: str) -> dict[str, Tensor]:
+def collate_batch(
+    batch: list[dict], pad_token_id: int, device: str
+) -> dict[str, Tensor]:
     lengths = [len(example["input_ids"]) for example in batch]
     max_len = max(lengths)
     max_choices = max(example["choice_count"] for example in batch)
@@ -341,7 +344,9 @@ def collate_batch(batch: list[dict], pad_token_id: int, device: str) -> dict[str
         "choice_slots": padded_slots.to(device),
         "choice_mask": choice_mask.to(device),
         "lengths": torch.tensor(lengths, device=device),
-        "targets": torch.tensor([example["target"] for example in batch], device=device),
+        "targets": torch.tensor(
+            [example["target"] for example in batch], device=device
+        ),
     }
 
 
@@ -354,6 +359,7 @@ def make_batches(
     device: str,
     rng: Random,
     shuffle: bool = False,
+    bucket_size: int = 2048,
 ) -> Iterator[dict[str, Tensor]]:
 
     if tokenizer.pad_token is None or tokenizer.pad_token_id is None:
@@ -363,21 +369,32 @@ def make_batches(
     if shuffle:
         rng.shuffle(rows)
 
-    batch, longest = [], 0
+    for start in range(0, len(rows), bucket_size):
+        encoded = [
+            encode_row(row, choices, tokenizer, rng)
+            for row in rows[start : start + bucket_size]
+        ]
+        encoded.sort(key=lambda example: len(example["input_ids"]))
 
-    for row in rows:
-        example = encode_row(row, choices, tokenizer, rng)
-        length = len(example["input_ids"])
+        batches, batch, longest = [], [], 0
 
-        if batch and (
-            len(batch) == batch_size
-            or max(longest, length) * (len(batch) + 1) > max_tokens
-        ):
+        for example in encoded:
+            length = len(example["input_ids"])
+
+            if batch and (
+                len(batch) == batch_size
+                or max(longest, length) * (len(batch) + 1) > max_tokens
+            ):
+                batches.append(batch)
+                batch, longest = [], 0
+
+            batch.append(example)
+            longest = max(longest, length)
+
+        batches.append(batch)
+
+        if shuffle:
+            rng.shuffle(batches)
+
+        for batch in batches:
             yield collate_batch(batch, tokenizer.pad_token_id, device)
-            batch, longest = [], 0
-
-        batch.append(example)
-        longest = max(longest, length)
-
-    if batch:
-        yield collate_batch(batch, tokenizer.pad_token_id, device)
