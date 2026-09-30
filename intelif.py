@@ -1,6 +1,5 @@
 from dataclasses import dataclass
 
-import torch
 from torch import Tensor, nn
 
 from lora import LoraConfig, inject_lora
@@ -9,20 +8,9 @@ from qwen import ModelConfig, Qwen3Model
 MODEL_ID = "Qwen/Qwen3-4B"
 
 
-def create_orthogonal_tensors(choices: int, dim: int) -> torch.Tensor:
-    assert choices <= dim
-
-    rand = torch.randn(dim, choices)
-    q, _ = torch.linalg.qr(rand)
-
-    return q.T
-
-
 @dataclass
 class IntelIfConfig:
     model_id: str
-    choice_dim: int = 256
-    temperature: float = 0.07
     lora_config: LoraConfig | None = None
     freeze_base: bool = True
 
