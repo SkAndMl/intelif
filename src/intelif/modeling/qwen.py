@@ -233,8 +233,11 @@ class Qwen3Model(nn.Module):
             if k.startswith("model.")
         }
 
-        model = Qwen3Model(cfg).to(cfg.dtype)
-        model.load_state_dict(state, strict=True)
+        with torch.device("meta"):
+            model = Qwen3Model(cfg)
+
+        model.load_state_dict(state, strict=True, assign=True)
+        model.rotary_emb = Qwen3RotaryEmbedding(cfg)
 
         return model
 

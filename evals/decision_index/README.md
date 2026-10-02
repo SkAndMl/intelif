@@ -28,12 +28,15 @@ python -m decision_index pipeline \
     --option model=UserMoonlight/intelif-qwen3-4b \
     --option revision=v0.1 \
     --suite-dataset <you>/decision-index-suite-0.2 \
-    --out runs/intelif-qwen3-4b
+    --out runs/intelif-qwen3-4b \
+    --compact
 ```
+
+`--compact` leaves the benchmark inputs out of `results.jsonl`, so the run can be shared without redistributing the suite. Add `--upload <you>/<results-dataset> --upload-path runs/intelif-qwen3-4b` to push the results to a private Hub dataset in the layout the Decision Index submissions expect.
 
 Engine options: `model` (Hub repo or local directory with `config.json` and `adapter.safetensors`), `revision`, `device`, `dtype`, `max_tokens` (default: the model's 40,960-token context window), `max_batch_tokens` (default 32,768).
 
-Add `--rows sample.jsonl.gz` after `python -m decision_index suite sample --n 100 --out sample.jsonl.gz` for a quick check. A full run is about 150k requests and takes about 2.3 hours on one RTX PRO 6000, with a median request latency of about 16 ms.
+Add `--rows sample.jsonl.gz` after `python -m decision_index suite sample --n 100 --out sample.jsonl.gz` for a quick check. A full run is about 150k requests and takes about 2.3 hours on one RTX PRO 6000, with a median request latency of about 16 ms. The v0.1 run is in [`UserMoonlight/intelif-decision-index`](https://huggingface.co/datasets/UserMoonlight/intelif-decision-index).
 
 ## Behaviour
 

@@ -77,6 +77,7 @@ def normalize_questions(
     for name, question in questions.items():
         if isinstance(question, (Choice, Noul, Score)):
             normalized[name] = question
+            continue
 
         try:
             normalized[name] = _question_adapter.validate_python(question)

@@ -27,6 +27,10 @@ dev = [
     "pytest>=9.1.1",
     "typesafe-sdk>=0.7.2",
 ]
+examples = [
+    "pillow>=12.3.0",
+    "rich>=15.0.0",
+]
 training = [
     "datasets>=5.0.1",
     "python-dotenv>=1.2.3",

@@ -10,6 +10,10 @@ The caller supplies the decision space in every request: there are no fixed labe
 
 Intelif is wire-compatible with TypeSafe's Jev (`POST /v1/systemone`), but not affiliated with it.
 
+![Intelif v0.1 playing Tetris](assets/tetris.gif)
+
+Intelif v0.1 playing Tetris, a game it was never trained on: for each piece, every legal landing is one option, and all of them are scored in a single forward pass (about 40 ms on an RTX PRO 6000). Reproduce it with `uv run --group examples python examples/tetris.py --gif assets/tetris.gif`; `examples/wikigame.py` plays the Wikipedia game the same way, scoring every link on a page.
+
 ## Model
 
 `intelif-qwen3-4b` v0.1 ([Hugging Face](https://huggingface.co/UserMoonlight/intelif-qwen3-4b)) is [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) with LoRA adapters (r=16 on every attention and MLP projection) and a linear scorer. Each option in the prompt is followed by an anchor token; the scorer reads the anchor's final hidden state, and the probabilities are a softmax over the options. One forward pass answers a question, whatever the number of options. The LoRA weights are merged at load time, so inference costs the same as the base model.
@@ -77,31 +81,35 @@ intelif ask --state "Where is my new card?" --choice "card arrival,refund,lost c
 
 ## Results
 
-Held-out results of the v0.1 adapter (accuracy and expected calibration error on test splits never used for training or model selection; BANKING77 held-out intents and CLINC150 are labels the model never saw in training):
+Held-out test splits, never used for training or model selection. BANKING77's 20 held-out intents and all of CLINC150 are labels the model never saw in training. Each cell is accuracy / expected calibration error; the zero-shot baselines score the same options with Qwen3-4B's log-probabilities, once from a raw prompt and once through the chat template without thinking.
 
-| split | accuracy | ECE |
-|---|---|---|
-| BANKING77, seen intents | 89.2% | 0.014 |
-| BANKING77, 20 held-out intents | 77.2% | 0.065 |
-| CLINC150 (never trained on) | 84.2% | 0.024 |
-| MASSIVE | 90.0% | 0.016 |
-| xLAM tool selection (unseen tools) | 99.9% | 0.003 |
-| ALFWorld next action | 84.3% | 0.026 |
-| WebShop next action | 54.6% | 0.066 |
-| MNLI mismatched | 91.9% | 0.025 |
-| SNLI | 92.8% | 0.022 |
-| QQP | 87.9% | 0.018 |
-| PAWS | 93.5% | 0.025 |
-| BoolQ | 88.8% | 0.027 |
-| CommonsenseQA | 82.8% | 0.038 |
-| OpenBookQA | 90.2% | 0.035 |
-| SciQ | 98.7% | 0.007 |
+| split | chance | Qwen3-4B, raw prompt | Qwen3-4B, chat | Intelif v0.1 |
+|---|---|---|---|---|
+| BANKING77, seen intents | 1.3% | 45.2% / 0.226 | 63.3% / 0.336 | **89.7% / 0.011** |
+| BANKING77, 20 held-out intents | 1.3% | 46.6% / 0.224 | 59.9% / 0.367 | **78.5% / 0.065** |
+| CLINC150 (never trained on) | 0.7% | 54.4% / 0.104 | 72.6% / 0.246 | **86.5% / 0.021** |
+| MASSIVE | 1.7% | 59.1% / 0.190 | 64.9% / 0.316 | **89.9% / 0.019** |
+| xLAM tool selection (unseen tools) | 32.4% | 98.2% / 0.012 | 98.9% / 0.010 | **99.9% / 0.002** |
+| ALFWorld next action | 4.0% | 55.1% / 0.236 | 59.0% / 0.390 | **85.5% / 0.029** |
+| WebShop next action | 13.7% | 26.4% / 0.404 | 20.7% / 0.709 | **56.0% / 0.061** |
+| MNLI mismatched | 38.6% | 69.6% / 0.191 | 80.8% / 0.181 | **92.0% / 0.020** |
+| SNLI | 38.3% | 68.6% / 0.219 | 82.1% / 0.173 | **92.7% / 0.019** |
+| QQP | 50.0% | 79.3% / 0.068 | 80.5% / 0.187 | **87.8% / 0.015** |
+| PAWS | 50.0% | 75.9% / 0.105 | 77.4% / 0.220 | **93.6% / 0.021** |
+| BoolQ | 50.0% | 85.6% / 0.063 | 84.6% / 0.149 | **88.9% / 0.023** |
+| CommonsenseQA | 20.0% | 51.5% / 0.151 | 74.3% / 0.244 | **82.7% / 0.028** |
+| OpenBookQA | 25.0% | 39.2% / 0.383 | 74.0% / 0.243 | **90.2% / 0.029** |
+| SciQ | 25.0% | 92.3% / 0.023 | 98.2% / 0.018 | **98.7% / 0.006** |
 
-ALFWorld and WebShop measure agreement with one recorded expert action, not task success.
+ALFWorld and WebShop measure agreement with one recorded expert action, not task success. The full numbers, including negative log-likelihood and chat with thinking, are in [`baseline_results.json`](https://huggingface.co/UserMoonlight/intelif-qwen3-4b/blob/main/baseline_results.json) and come from `training/baseline.py`.
 
 ### Decision Index 0.2.1
 
-TODO: fill in from the packaged run (`evals/decision_index/`): index, the five area scores and the median latency.
+| index | Knowledge & Reasoning | Language Understanding | Retrieval & Classification | Tools & Automation | Arts & Human Taste | median latency |
+|---|---|---|---|---|---|---|
+| **31.77** | 18.3 | 31.1 | 39.6 | 51.0 | 17.8 | 16.5 ms |
+
+Chance-corrected scores (0 is random guessing, 100 is perfect) from the packaged engine on all 150,317 requests, with every request answered. The raw index is 48.62. Run on one NVIDIA RTX PRO 6000 Blackwell; the results, per-benchmark scores and environment are in [`UserMoonlight/intelif-decision-index`](https://huggingface.co/datasets/UserMoonlight/intelif-decision-index). The model is strongest where the suite looks like its training data (BFCL 89.6, BANKING77 83.6, CLINC150 81.5) and near chance on knowledge-heavy, multi-step and taste benchmarks (GPQA, HLE, CRUXEval, ForecastBench). BANKING77's train split is part of the training data.
 
 ## Evaluation and training
 
