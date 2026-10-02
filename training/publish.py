@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from dotenv import find_dotenv, load_dotenv
-from huggingface_hub import CommitOperationAdd, HfApi
+from huggingface_hub import CommitOperationAdd, HfApi, hf_hub_download
 
 load_dotenv(find_dotenv())
 
@@ -66,11 +66,19 @@ Best checkpoint at step {best["step"]} (summed validation loss {best["val_loss"]
 """
 
 
+def get_repo_id(api: HfApi) -> str:
+    return f"{api.whoami()['name']}/{REPO_NAME}"
+
+
+def download_adapter(revision: str | None = None) -> str:
+    return hf_hub_download(get_repo_id(HfApi()), ADAPTER_PATH, revision=revision)
+
+
 def upload_run(private: bool = True) -> str:
     results = json.loads(Path(RESULTS_PATH).read_text())
 
     api = HfApi()
-    repo_id = f"{api.whoami()['name']}/{REPO_NAME}"
+    repo_id = get_repo_id(api)
     api.create_repo(repo_id, private=private, exist_ok=True)
 
     api.create_commit(

@@ -5,14 +5,14 @@ from collections import Counter, deque
 from random import Random
 
 import torch
+from data import DATASET_REVISIONS, load_intent_data, make_batches
+from publish import ADAPTER_PATH, LOG_PATH, RESULTS_PATH, upload_run
 from safetensors.torch import load_file, save_file
 from transformers import AutoTokenizer
 
-from data import DATASET_REVISIONS, load_intent_data, make_batches
-from hf import ADAPTER_PATH, LOG_PATH, RESULTS_PATH, upload_run
-from intelif import MODEL_ID, IntelIf, IntelIfConfig
-from lora import LoraConfig
-from qwen import ModelConfig
+from intelif.modeling.intelif import MODEL_ID, IntelIfModel
+from intelif.modeling.lora import LoraConfig, inject_lora
+from intelif.modeling.qwen import ModelConfig, Qwen3Model
 
 batch_size = 32
 max_tokens = 16384
@@ -35,13 +35,23 @@ train_rng = Random(42)
 lora_config = LoraConfig()
 base_model_cfg = ModelConfig()
 
-model = IntelIf(
-    cfg=IntelIfConfig(
-        model_id=MODEL_ID,
-        lora_config=lora_config,
-    ),
-    base_model_cfg=base_model_cfg,
+BASE_MODEL = "Qwen/Qwen3-4B"
+BASE_REVISION = "1cfa9a7208912126459214e8b04321603b3df60c"
+
+lora_config = LoraConfig()
+base_model_cfg = ModelConfig(gradient_checkpointing=False)
+
+model = IntelIfModel(
+    Qwen3Model.from_pretrained(
+        BASE_MODEL,
+        base_model_cfg,
+        revision=BASE_REVISION,
+    )
 ).to(device)
+
+model.base_model.requires_grad_(False)
+
+inject_lora(model.base_model, lora_config)
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 

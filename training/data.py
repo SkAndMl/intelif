@@ -10,6 +10,9 @@ from sklearn.model_selection import train_test_split
 from torch import Tensor
 from transformers import PreTrainedTokenizerBase
 
+from intelif.render import encode_question
+from intelif.types import Choice
+
 load_dotenv(find_dotenv())
 
 DATASET_REVISIONS = {
@@ -277,15 +280,6 @@ def load_intent_data(seed: int = 42) -> dict:
     }
 
 
-def construct_input_text(
-    state: str, question: str, choices: list[str], anchor_token: str
-) -> str:
-    text = f"STATE:\n{state}\nQUESTION:\n{question}\nCHOICES:\n"
-    for choice in choices:
-        text += f"{readable_intent(choice)} {anchor_token}\n"
-    return text + "DECISION:"
-
-
 def encode_row(
     row: dict,
     choices: dict[str, list[str]],
@@ -300,24 +294,19 @@ def encode_row(
     candidates = catalog.copy()
     rng.shuffle(candidates)
 
-    text = construct_input_text(
-        row["state"],
-        row.get("question", QUESTION),
-        candidates,
-        tokenizer.pad_token,
+    question = Choice(
+        criteria={readable_intent(candidate): None for candidate in candidates},
+        instructions=row.get("question", QUESTION),
     )
-    ids = torch.tensor(tokenizer.encode(text), dtype=torch.long)
 
-    anchor_mask = ids == tokenizer.pad_token_id
-    if anchor_mask.sum().item() != len(candidates):
-        raise ValueError("Expected one choice anchor per candidate")
+    if len(question.criteria) != len(candidates):
+        raise ValueError("Two candidates render to the same label")
 
-    slots = torch.full_like(ids, -1)
-    slots[anchor_mask] = torch.arange(len(candidates))
+    encoded = encode_question(tokenizer, row["state"], question, tokenizer.pad_token_id)
 
     return {
-        "input_ids": ids,
-        "choice_slots": slots,
+        "input_ids": encoded["input_ids"],
+        "choice_slots": encoded["choice_slots"],
         "target": candidates.index(row["gold_intent"]),
         "choice_count": len(candidates),
     }
