@@ -1,23 +1,23 @@
 [project]
-name = "vara"
-version = "0.1.0"
-description = "Add your description here"
+name = "intelif"
+dynamic = ["version"]
+description = "Typed probabilistic decisions over caller-supplied choices, on Qwen3-4B."
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
-    "datasets>=5.0.1",
-    "decision-index",
+    "huggingface_hub>=0.34",
     "pydantic>=2.13.5",
-    "python-dotenv>=1.2.3",
-    "scikit-learn>=1.9.1",
+    "safetensors>=0.4",
     "torch>=2.14.0",
     "transformers>=5.17.0",
-    "huggingface_hub>=0.34",
-    "safetensors>=0.4",
 ]
 
 [project.optional-dependencies]
 server = ["fastapi>=0.115", "uvicorn>=0.30"]
+decision-index = [
+    "decision-index @ git+https://github.com/apolinario/decision-index@87d4650b42b377c0291a89c1f1a879f9b31082bf",
+]
 
 [project.scripts]
 intelif = "intelif.cli:main"
@@ -25,14 +25,23 @@ intelif = "intelif.cli:main"
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "typesafe-sdk>=0.7.2",
 ]
-
-[tool.uv.sources]
-decision-index = { git = "https://github.com/apolinario/decision-index", rev = "87d4650b42b377c0291a89c1f1a879f9b31082bf" }
+training = [
+    "datasets>=5.0.1",
+    "python-dotenv>=1.2.3",
+    "scikit-learn>=1.9.1",
+]
 
 [build-system]
 requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
+[tool.hatch.version]
+path = "src/intelif/_version.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/intelif"]
+
+[tool.hatch.metadata]
+allow-direct-references = true

@@ -6,28 +6,20 @@ from pathlib import Path
 from random import Random
 
 import torch
-from huggingface_hub import HfApi, hf_hub_download
-from safetensors.torch import load_file
+from data import SEED, build_question, load_data
 from torch import Tensor
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
 
-from data import QUESTION, load_intent_data, make_batches, readable_intent
-from hf import ADAPTER_PATH, REPO_NAME
-from intelif import MODEL_ID, IntelIf, IntelIfConfig
-from lora import LoraConfig
-from qwen import ModelConfig
+from intelif import Intelif
+from intelif.hub import DEFAULT_MODEL, DEFAULT_REVISION
+from intelif.render import option_line, question_options, state_text, to_text
 
 ECE_BINS = 15
-RESULTS_PATH = "baseline_results.json"
 LM_METHODS = {
     "zero_shot_lm": "raw",
     "zero_shot_chat": "chat",
     "zero_shot_chat_no_think": "chat_no_think",
 }
-
-
-def row_choices(row: dict, catalogs: dict[str, list[str]]) -> list[str]:
-    return row.get("choices") or catalogs[row.get("choice_pool", row["source"])]
 
 
 def summarize(confidences: list[float], correct: list[bool], nlls: list[float]) -> dict:
@@ -48,8 +40,13 @@ def summarize(confidences: list[float], correct: list[bool], nlls: list[float]) 
     }
 
 
-def chance_metrics(rows: list[dict], catalogs: dict[str, list[str]]) -> dict:
-    sizes = [len(row_choices(row, catalogs)) for row in rows]
+def questions(rows: list[dict]) -> list[tuple]:
+    rng = Random(SEED)
+    return [(row, *build_question(row, rng)) for row in rows]
+
+
+def chance_metrics(items: list[tuple]) -> dict:
+    sizes = [len(question_options(question)) for _, question, _ in items]
 
     return {
         "accuracy": sum(1 / size for size in sizes) / len(sizes),
@@ -58,52 +55,38 @@ def chance_metrics(rows: list[dict], catalogs: dict[str, list[str]]) -> dict:
     }
 
 
-def lm_prompt(state: str, question: str, choices: list[str]) -> str:
-    text = f"STATE:\n{state}\nQUESTION:\n{question}\nCHOICES:\n"
-    text += "".join(f"{readable_intent(choice)}\n" for choice in choices)
+def lm_body(row: dict, question, options: dict) -> str:
+    text = f"STATE:\n{state_text(row['state'])}\n"
+    text += f"QUESTION:\n{to_text(question.instructions)}\nCHOICES:\n"
+    text += "".join(f"{option_line(key, value)}\n" for key, value in options.items())
 
-    return text + "DECISION:"
-
-
-def chat_prompt(
-    tokenizer: PreTrainedTokenizerBase,
-    state: str,
-    question: str,
-    choices: list[str],
-    thinking: bool,
-) -> str:
-    body = f"STATE:\n{state}\nQUESTION:\n{question}\nCHOICES:\n"
-    body += "".join(f"{readable_intent(choice)}\n" for choice in choices)
-    body += "\nReply with exactly one of the choices, copied verbatim."
-
-    return tokenizer.apply_chat_template(
-        [{"role": "user", "content": body}],
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=thinking,
-    )
+    return text
 
 
 def lm_inputs(
-    tokenizer: PreTrainedTokenizerBase,
-    row: dict,
-    candidates: list[str],
-    style: str,
-) -> tuple[str, list[str]]:
-    question = row.get("question", QUESTION)
+    tokenizer: PreTrainedTokenizerBase, row: dict, question, style: str
+) -> tuple[str, list[str], list[str]]:
+    options = question_options(question)
+    keys = list(options)
+    body = lm_body(row, question, options)
 
     if style == "raw":
-        return (
-            lm_prompt(row["state"], question, candidates),
-            [f" {readable_intent(choice)}\n" for choice in candidates],
-        )
+        return body + "DECISION:", [f" {key}\n" for key in keys], keys
 
-    return (
-        chat_prompt(
-            tokenizer, row["state"], question, candidates, thinking=style == "chat"
-        ),
-        [f"{readable_intent(choice)}<|im_end|>" for choice in candidates],
+    prompt = tokenizer.apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": body
+                + "\nReply with exactly one option key, copied verbatim.",
+            }
+        ],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=style == "chat",
     )
+
+    return prompt, [f"{key}<|im_end|>" for key in keys], keys
 
 
 @torch.no_grad()
@@ -163,23 +146,17 @@ def choice_logprobs(
 def lm_metrics(
     lm: AutoModelForCausalLM,
     tokenizer: PreTrainedTokenizerBase,
-    rows: list[dict],
-    catalogs: dict[str, list[str]],
+    items: list[tuple],
     device: str,
     style: str,
 ) -> dict:
-    rng = Random(42)
     confidences, correct, nlls = [], [], []
 
-    for row in rows:
-        candidates = row_choices(row, catalogs).copy()
-        rng.shuffle(candidates)
-
-        prompt, continuations = lm_inputs(tokenizer, row, candidates, style)
-        scores = choice_logprobs(lm, tokenizer, prompt, continuations, device)
-
-        probs = scores.log_softmax(-1)
-        target = candidates.index(row["gold_intent"])
+    for row, question, gold in items:
+        prompt, continuations, keys = lm_inputs(tokenizer, row, question, style)
+        probs = choice_logprobs(lm, tokenizer, prompt, continuations, device)
+        probs = probs.log_softmax(-1)
+        target = keys.index(gold)
 
         confidences.append(probs.max().exp().item())
         correct.append(probs.argmax().item() == target)
@@ -188,61 +165,23 @@ def lm_metrics(
     return summarize(confidences, correct, nlls)
 
 
-@torch.no_grad()
-def intelif_metrics(
-    model: IntelIf,
-    tokenizer: PreTrainedTokenizerBase,
-    rows: list[dict],
-    catalogs: dict[str, list[str]],
-    device: str,
-) -> dict:
+def intelif_metrics(model: Intelif, items: list[tuple]) -> dict:
     confidences, correct, nlls = [], [], []
 
-    for batch in make_batches(rows, catalogs, tokenizer, 32, 4096, device, Random(42)):
-        with torch.autocast(
-            device_type="cuda", dtype=torch.bfloat16, enabled=device == "cuda"
-        ):
-            logits = model(
-                input_ids=batch["input_ids"],
-                lengths=batch["lengths"],
-                choice_slots=batch["choice_slots"],
-                choice_mask=batch["choice_mask"],
-            )
+    for row, question, gold in items:
+        answer = model.system_one(row["state"], {"q": question}).answers["q"]
+        probabilities = (
+            answer.probabilities
+            if answer.type == "choice"
+            else {"true": answer.noul, "false": 1 - answer.noul}
+        )
+        predicted = max(probabilities, key=probabilities.get)
 
-        probs = logits.float().log_softmax(-1)
-        targets = batch["targets"]
-
-        confidences += probs.max(-1).values.exp().tolist()
-        correct += (probs.argmax(-1) == targets).tolist()
-        nlls += (-probs.gather(-1, targets[:, None]).squeeze(-1)).tolist()
+        confidences.append(probabilities[predicted])
+        correct.append(predicted == gold)
+        nlls.append(-math.log(max(probabilities[gold], 1e-12)))
 
     return summarize(confidences, correct, nlls)
-
-
-def resolve_adapter(path: str) -> str:
-    if Path(path).exists():
-        return path
-
-    repo_id = f"{HfApi().whoami()['name']}/{REPO_NAME}"
-    return hf_hub_download(repo_id, ADAPTER_PATH)
-
-
-def load_intelif(adapter_path: str, device: str) -> IntelIf:
-    model = IntelIf(
-        cfg=IntelIfConfig(model_id=MODEL_ID, lora_config=LoraConfig()),
-        base_model_cfg=ModelConfig(gradient_checkpointing=False),
-    ).to(device)
-
-    trainable = {
-        name for name, parameter in model.named_parameters() if parameter.requires_grad
-    }
-    incompatible = model.load_state_dict(
-        load_file(adapter_path, device=device), strict=False
-    )
-    if incompatible.unexpected_keys or set(incompatible.missing_keys) & trainable:
-        raise RuntimeError("The adapter does not match the model")
-
-    return model.eval()
 
 
 def print_table(results: dict) -> None:
@@ -268,60 +207,62 @@ def print_table(results: dict) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--adapter", default=ADAPTER_PATH)
+    parser.add_argument("--config", default="config.json")
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--revision", default=DEFAULT_REVISION)
+    parser.add_argument("--out", default="runs/baseline_results.json")
     parser.add_argument("--skip-lm", action="store_true")
     parser.add_argument("--skip-intelif", action="store_true")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    data = load_intent_data()
-    catalogs = data["choices"]
+    data = load_data()
     splits = {
-        name: Random(0).sample(rows, min(args.limit, len(rows))) if args.limit else rows
+        name: questions(
+            Random(0).sample(rows, min(args.limit, len(rows))) if args.limit else rows
+        )
         for name, rows in data["final"].items()
     }
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     results = {
-        name: {"chance": chance_metrics(rows, catalogs)}
-        for name, rows in splits.items()
+        name: {"chance": chance_metrics(items)} for name, items in splits.items()
     }
 
     if not args.skip_intelif:
-        adapter = resolve_adapter(args.adapter)
-        print(f"loading adapter from {adapter}")
+        model = Intelif.from_pretrained(args.model, revision=args.revision)
 
-        model = load_intelif(adapter, device)
-
-        for name, rows in splits.items():
+        for name, items in splits.items():
             start = time.perf_counter()
-            results[name]["intelif"] = intelif_metrics(
-                model, tokenizer, rows, catalogs, device
-            )
+            results[name]["intelif"] = intelif_metrics(model, items)
             print(
                 f"intelif/{name}: {results[name]['intelif']} ({time.perf_counter() - start:.0f}s)"
             )
 
         del model
-        torch.cuda.empty_cache()
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
     if not args.skip_lm:
-        lm = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=torch.bfloat16)
+        config = json.loads(Path(args.config).read_text())
+        tokenizer = AutoTokenizer.from_pretrained(
+            config["base_model"], revision=config["base_revision"]
+        )
+        lm = AutoModelForCausalLM.from_pretrained(
+            config["base_model"], revision=config["base_revision"], dtype=torch.bfloat16
+        )
         lm = lm.to(device).eval()
 
         for method, style in LM_METHODS.items():
-            for name, rows in splits.items():
+            for name, items in splits.items():
                 start = time.perf_counter()
-                results[name][method] = lm_metrics(
-                    lm, tokenizer, rows, catalogs, device, style
-                )
+                results[name][method] = lm_metrics(lm, tokenizer, items, device, style)
                 print(
                     f"{method}/{name}: {results[name][method]} ({time.perf_counter() - start:.0f}s)"
                 )
 
-    with open(RESULTS_PATH, "w") as file:
-        json.dump(results, file, indent=2)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(results, indent=2))
 
     print_table(results)
 

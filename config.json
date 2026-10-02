@@ -1,0 +1,30 @@
+{
+  "intelif_config_version": 1,
+  "name": "intelif-qwen3-4b",
+  "release": "v0.1",
+  "base_model": "Qwen/Qwen3-4B",
+  "base_revision": "1cfa9a7208912126459214e8b04321603b3df60c",
+  "architecture": "qwen3",
+  "base_config": {
+    "model_dim": 2560,
+    "head_dim": 128,
+    "num_heads": 32,
+    "num_kv_heads": 8,
+    "num_layers": 36,
+    "rope_base": 1000000.0,
+    "vocab_size": 151936,
+    "intermediate_size": 9728,
+    "rms_norm_eps": 1e-06,
+    "context_length": 40960
+  },
+  "lora": {
+    "r": 16,
+    "lora_alpha": 32.0,
+    "lora_dropout": 0.0,
+    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  },
+  "scorer": {"type": "linear", "in_features": 2560, "bias": false},
+  "prompt_format": "intelif-v1",
+  "anchor_token": "<|endoftext|>",
+  "max_tokens": 40960
+}

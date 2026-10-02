@@ -219,3 +219,6 @@ __marimo__/
 
 # Decision Index suite build (licensed data, never commit)
 suite-build/
+
+# Training and evaluation outputs
+runs/

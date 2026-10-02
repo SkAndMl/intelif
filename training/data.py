@@ -11,9 +11,14 @@ from torch import Tensor
 from transformers import PreTrainedTokenizerBase
 
 from intelif.render import encode_question
-from intelif.types import Choice
+from intelif.types import Choice, Noul
 
 load_dotenv(find_dotenv())
+
+SEED = 42
+VALIDATION_SIZE = 500
+FINAL_SIZE = 1000
+TRAIN_CAPS = {"mnli": 40000, "snli": 20000, "qqp": 20000, "paws": 20000}
 
 DATASET_REVISIONS = {
     "mteb/banking77": "18072d2685ea682290f7b8924d94c62acc19c0b2",
@@ -21,6 +26,13 @@ DATASET_REVISIONS = {
     "DeepPavlov/clinc150": "d835118ecd5ffe5488d22e9e58d1c23d18c33229",
     "Salesforce/xlam-function-calling-60k": "26d14ebfe18b1f7b524bd39b404b50af5dc97866",
     "osunlp/early-experience": "7f1dfbe4f7a100ee1337843b1abbd2c25b8cf7ce",
+    "nyu-mll/glue": "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
+    "stanfordnlp/snli": "cdb5c3d5eed6ead6e5a341c8e56e669bb666725b",
+    "google/boolq": "35b264d03638db9f4ce671b711558bf7ff0f80d5",
+    "google-research-datasets/paws": "161ece9501cf0a11f3e48bd356eaa82de46d6a09",
+    "tau/commonsense_qa": "94630fe30dad47192a8546eb75f094926d47e155",
+    "allenai/openbookqa": "388097ea7776314e93a529163e0fea805b8a6454",
+    "allenai/sciq": "2c94ad3e1aafab77146f384e23536f97a4849815",
 }
 
 # Chosen once with random.Random(42).sample(sorted(BANKING77 labels), 20).
@@ -50,23 +62,209 @@ HELD_OUT_BANKING_INTENTS = frozenset(
     }
 )
 
-QUESTION = "What is the intent?"
+INTENT_QUESTION = "What is the intent?"
 TOOL_QUESTION = "Which tool should be called?"
 ACTION_QUESTION = "Which action should the agent take next?"
+NLI_QUESTION = "How does the hypothesis relate to the premise?"
+NLI_NOUL = "Does the premise entail the hypothesis?"
+MCQ_QUESTION = "Which answer is correct?"
+
+NLI_LABELS = {
+    "entailment": "The hypothesis must be true if the premise is true.",
+    "neutral": "The hypothesis might or might not be true given the premise.",
+    "contradiction": "The hypothesis cannot be true if the premise is true.",
+}
 
 ACTIONS_MARKER = "Your admissible actions of the current situation are:"
 ACTION_PATTERN = re.compile(r"^\s*\[?(['\"])(.*)\1\]?[,.]*\s*$", re.MULTILINE)
 MAX_STATE_CHARS = 4000
 MAX_ACTION_CHOICES = 64
+LETTERS = "ABCDEFGHIJ"
 
 
-def readable_intent(name: str) -> str:
-    return name.replace("_", " ")
+def readable(label: str) -> str:
+    return label.replace("_", " ")
 
 
-def xlam_rows(xlam) -> list[dict]:
-    rows = []
+def catalog_row(state, instructions: str, criteria: dict, gold: str, source: str):
+    return {
+        "kind": "catalog",
+        "state": state,
+        "instructions": instructions,
+        "criteria": criteria,
+        "gold": gold,
+        "source": source,
+    }
 
+
+def letters_row(state, instructions: str, options: list[str], gold: int, source: str):
+    return {
+        "kind": "letters",
+        "state": state,
+        "instructions": instructions,
+        "options": options,
+        "gold": gold,
+        "source": source,
+    }
+
+
+def noul_row(state, instructions: str, answer: bool, source: str):
+    return {
+        "kind": "noul",
+        "state": state,
+        "instructions": instructions,
+        "gold": "true" if answer else "false",
+        "source": source,
+    }
+
+
+def build_question(row: dict, rng: Random) -> tuple[Choice | Noul, str]:
+    if row["kind"] == "noul":
+        return Noul(instructions=row["instructions"]), row["gold"]
+
+    if row["kind"] == "letters":
+        order = list(range(len(row["options"])))
+        rng.shuffle(order)
+        criteria = {LETTERS[i]: row["options"][j] for i, j in enumerate(order)}
+
+        return (
+            Choice(criteria=criteria, instructions=row["instructions"]),
+            LETTERS[order.index(row["gold"])],
+        )
+
+    keys = list(row["criteria"])
+    rng.shuffle(keys)
+    criteria = {key: row["criteria"][key] for key in keys}
+
+    return Choice(criteria=criteria, instructions=row["instructions"]), row["gold"]
+
+
+def sample(rows: list, size: int, seed: int = SEED) -> list:
+    return Random(seed).sample(rows, min(size, len(rows)))
+
+
+def split_by_group(rows: list[dict], groups: list) -> tuple[list, list, list]:
+    unique = sorted(set(groups))
+    train_groups, held_out = train_test_split(unique, test_size=0.1, random_state=SEED)
+    train_groups = set(train_groups)
+    val_groups = set(held_out[: len(held_out) // 2])
+
+    train, val, test = [], [], []
+    for row, group in zip(rows, groups):
+        if group in train_groups:
+            train.append(row)
+        elif group in val_groups:
+            val.append(row)
+        else:
+            test.append(row)
+
+    return train, val, test
+
+
+def intent_data() -> tuple[list, dict, dict]:
+    banking = load_dataset(
+        "mteb/banking77", revision=DATASET_REVISIONS["mteb/banking77"]
+    )
+    massive = load_dataset(
+        "SetFit/amazon_massive_intent_en-US",
+        revision=DATASET_REVISIONS["SetFit/amazon_massive_intent_en-US"],
+    )
+    clinc = load_dataset(
+        "DeepPavlov/clinc150", revision=DATASET_REVISIONS["DeepPavlov/clinc150"]
+    )
+    clinc_intents = load_dataset(
+        "DeepPavlov/clinc150",
+        "intents",
+        revision=DATASET_REVISIONS["DeepPavlov/clinc150"],
+    )["intents"]
+
+    banking_names = sorted(banking["train"].unique("label_text"))
+    if len(banking_names) != 77 or not HELD_OUT_BANKING_INTENTS < set(banking_names):
+        raise ValueError("BANKING77 labels changed; review the held-out intent list")
+
+    seen_banking = {
+        readable(n): None for n in banking_names if n not in HELD_OUT_BANKING_INTENTS
+    }
+    all_banking = {readable(n): None for n in banking_names}
+    massive_catalog = {
+        readable(n): None for n in sorted(massive["train"].unique("label_text"))
+    }
+    clinc_names = {row["id"]: row["name"] for row in clinc_intents}
+    clinc_catalog = {readable(n): None for n in sorted(clinc_names.values())}
+
+    def banking_rows(split: str, catalog: dict, keep) -> list:
+        return [
+            catalog_row(
+                row["text"],
+                INTENT_QUESTION,
+                catalog,
+                readable(row["label_text"]),
+                "banking77",
+            )
+            for row in banking[split]
+            if keep(row["label_text"])
+        ]
+
+    def massive_rows(split: str) -> list:
+        return [
+            catalog_row(
+                row["text"],
+                INTENT_QUESTION,
+                massive_catalog,
+                readable(row["label_text"]),
+                "massive",
+            )
+            for row in massive[split]
+        ]
+
+    banking_train = banking_rows(
+        "train", seen_banking, lambda n: n not in HELD_OUT_BANKING_INTENTS
+    )
+    banking_train, banking_val = train_test_split(
+        banking_train,
+        test_size=0.1,
+        random_state=SEED,
+        stratify=[row["gold"] for row in banking_train],
+    )
+
+    clinc_test = [
+        catalog_row(
+            row["utterance"],
+            INTENT_QUESTION,
+            clinc_catalog,
+            readable(clinc_names[row["label"]]),
+            "clinc150",
+        )
+        for row in clinc["test"]
+        if row["label"] is not None
+    ]
+
+    train = banking_train + massive_rows("train")
+    validation = {"banking77": banking_val, "massive": massive_rows("validation")}
+    final = {
+        "banking77_seen": banking_rows(
+            "test", all_banking, lambda n: n not in HELD_OUT_BANKING_INTENTS
+        ),
+        "banking77_held_out": banking_rows(
+            "test", all_banking, lambda n: n in HELD_OUT_BANKING_INTENTS
+        ),
+        "massive": massive_rows("test"),
+        "clinc150": clinc_test,
+    }
+
+    return train, validation, final
+
+
+def xlam_data() -> tuple[list, list, list]:
+    xlam = load_dataset(
+        "json",
+        data_files="hf://datasets/Salesforce/xlam-function-calling-60k"
+        f"@{DATASET_REVISIONS['Salesforce/xlam-function-calling-60k']}"
+        "/xlam_function_calling_60k.json",
+        split="train",
+    )
+
+    rows, groups = [], []
     for row in xlam:
         tools = json.loads(row["tools"])
         names = [tool["name"] for tool in tools]
@@ -75,28 +273,31 @@ def xlam_rows(xlam) -> list[dict]:
         if len(called) != 1 or not called < set(names) or len(set(names)) != len(names):
             continue
 
-        choices = [f"{tool['name']}: {tool.get('description', '')}" for tool in tools]
         gold = called.pop()
+        criteria = {tool["name"]: tool.get("description") or None for tool in tools}
+        rows.append(catalog_row(row["query"], TOOL_QUESTION, criteria, gold, "xlam"))
+        groups.append(gold)
 
-        rows.append(
-            {
-                "state": row["query"],
-                "source": "xlam",
-                "question": TOOL_QUESTION,
-                "choices": choices,
-                "gold_intent": choices[names.index(gold)],
-                "group": gold,
-            }
+    return split_by_group(rows, groups)
+
+
+def agent_data(source: str) -> tuple[list, list, list]:
+    revision = DATASET_REVISIONS["osunlp/early-experience"]
+    if source == "alfworld":
+        dataset = load_dataset(
+            "osunlp/early-experience", "alfworld", split="expert", revision=revision
+        )
+    else:
+        dataset = load_dataset(
+            "json",
+            data_files=f"hf://datasets/osunlp/early-experience@{revision}"
+            "/webshop/expert_sft.jsonl",
+            split="train",
         )
 
-    return rows
-
-
-def agent_rows(dataset, source: str) -> list[dict]:
-    rows, seen = [], set()
-
+    rows, groups, seen = [], [], set()
     for row in dataset:
-        prompt: str = row["messages"][-2]["content"]
+        prompt = row["messages"][-2]["content"]
         state, listing = prompt.split(ACTIONS_MARKER)
         listing = listing.split("Now it's your turn")[0]
 
@@ -115,234 +316,250 @@ def agent_rows(dataset, source: str) -> list[dict]:
 
         seen.add(prompt)
         rows.append(
-            {
-                "state": state.strip(),
-                "source": source,
-                "question": ACTION_QUESTION,
-                "choices": actions,
-                "gold_intent": gold,
-                "group": re.search(r"Your task is to: (.*)", state).group(1),
-            }
+            catalog_row(
+                state.strip(),
+                ACTION_QUESTION,
+                {action: None for action in actions},
+                gold,
+                source,
+            )
         )
+        groups.append(re.search(r"Your task is to: (.*)", state).group(1))
 
-    return rows
+    return split_by_group(rows, groups)
 
 
-def split_by_group(rows: list[dict], seed: int) -> tuple[list, list, list]:
-    groups = sorted({row["group"] for row in rows})
-    train_groups, held_out = train_test_split(groups, test_size=0.1, random_state=seed)
+def nli_row(premise: str, hypothesis: str, label: int, source: str, rng: Random):
+    name = list(NLI_LABELS)[label]
+    state = f"Premise: {premise}\nHypothesis: {hypothesis}"
+    style = rng.random()
 
-    train_groups = set(train_groups)
-    val_groups = set(held_out[: len(held_out) // 2])
-    test_groups = set(held_out[len(held_out) // 2 :])
+    if style < 0.3:
+        return noul_row(state, NLI_NOUL, name == "entailment", source)
 
-    return (
-        [row for row in rows if row["group"] in train_groups],
-        [row for row in rows if row["group"] in val_groups],
-        [row for row in rows if row["group"] in test_groups],
+    if style < 0.55:
+        return letters_row(state, NLI_QUESTION, list(NLI_LABELS), label, source)
+
+    return catalog_row(state, NLI_QUESTION, dict(NLI_LABELS), name, source)
+
+
+def pair_data() -> tuple[list, dict, dict]:
+    glue = DATASET_REVISIONS["nyu-mll/glue"]
+    mnli = load_dataset("nyu-mll/glue", "mnli", revision=glue)
+    snli = load_dataset(
+        "stanfordnlp/snli", revision=DATASET_REVISIONS["stanfordnlp/snli"]
+    )
+    qqp = load_dataset("nyu-mll/glue", "qqp", revision=glue)
+    paws = load_dataset(
+        "google-research-datasets/paws",
+        "labeled_final",
+        revision=DATASET_REVISIONS["google-research-datasets/paws"],
+    )
+    boolq = load_dataset("google/boolq", revision=DATASET_REVISIONS["google/boolq"])
+
+    rng = Random(SEED)
+
+    def nli(split, source: str, size: int) -> list:
+        rows = [row for row in split if row["label"] in (0, 1, 2)]
+        return [
+            nli_row(row["premise"], row["hypothesis"], row["label"], source, rng)
+            for row in sample(rows, size)
+        ]
+
+    def qqp_rows(split, size: int) -> list:
+        return [
+            noul_row(
+                {"question1": row["question1"], "question2": row["question2"]},
+                "Do the two questions ask the same thing?",
+                row["label"] == 1,
+                "qqp",
+            )
+            for row in sample(list(split), size)
+        ]
+
+    def paws_rows(split, size: int) -> list:
+        return [
+            noul_row(
+                f"Sentence 1: {row['sentence1']}\nSentence 2: {row['sentence2']}",
+                "Are the two sentences paraphrases of each other?",
+                row["label"] == 1,
+                "paws",
+            )
+            for row in sample(list(split), size)
+        ]
+
+    def boolq_rows(rows: list) -> list:
+        return [
+            noul_row(
+                row["passage"],
+                row["question"].capitalize() + "?",
+                row["answer"],
+                "boolq",
+            )
+            for row in rows
+        ]
+
+    qqp_held = sample(list(qqp["validation"]), VALIDATION_SIZE + FINAL_SIZE, SEED + 1)
+    boolq_held = sample(
+        list(boolq["validation"]), VALIDATION_SIZE + FINAL_SIZE, SEED + 1
     )
 
-
-def banking_test_rows(banking, held_out: bool) -> list[dict[str, str]]:
-    return [
-        {
-            "state": row["text"],
-            "source": "banking77",
-            "gold_intent": row["label_text"],
-            "choice_pool": "banking77_final",
-        }
-        for row in banking["test"]
-        if (row["label_text"] in HELD_OUT_BANKING_INTENTS) == held_out
-    ]
-
-
-def massive_rows(massive, split: str) -> list[dict[str, str]]:
-    return [
-        {
-            "state": row["text"],
-            "source": "massive",
-            "gold_intent": row["label_text"],
-        }
-        for row in massive[split]
-    ]
-
-
-def load_intent_data(seed: int = 42) -> dict:
-    banking = load_dataset(
-        "mteb/banking77", revision=DATASET_REVISIONS["mteb/banking77"]
+    train = (
+        nli(mnli["train"], "mnli", TRAIN_CAPS["mnli"])
+        + nli(snli["train"], "snli", TRAIN_CAPS["snli"])
+        + qqp_rows(qqp["train"], TRAIN_CAPS["qqp"])
+        + paws_rows(paws["train"], TRAIN_CAPS["paws"])
+        + boolq_rows(list(boolq["train"]))
     )
-    massive = load_dataset(
-        "SetFit/amazon_massive_intent_en-US",
-        revision=DATASET_REVISIONS["SetFit/amazon_massive_intent_en-US"],
-    )
-    clinc = load_dataset(
-        "DeepPavlov/clinc150", revision=DATASET_REVISIONS["DeepPavlov/clinc150"]
-    )
-    clinc_intents = load_dataset(
-        "DeepPavlov/clinc150",
-        "intents",
-        revision=DATASET_REVISIONS["DeepPavlov/clinc150"],
-    )["intents"]
-
-    xlam = load_dataset(
-        "json",
-        data_files="hf://datasets/Salesforce/xlam-function-calling-60k"
-        f"@{DATASET_REVISIONS['Salesforce/xlam-function-calling-60k']}"
-        "/xlam_function_calling_60k.json",
-        split="train",
-    )
-    alfworld = load_dataset(
-        "osunlp/early-experience",
-        "alfworld",
-        split="expert",
-        revision=DATASET_REVISIONS["osunlp/early-experience"],
-    )
-    webshop = load_dataset(
-        "json",
-        data_files="hf://datasets/osunlp/early-experience"
-        f"@{DATASET_REVISIONS['osunlp/early-experience']}"
-        "/webshop/expert_sft.jsonl",
-        split="train",
-    )
-
-    banking_names = set(banking["train"].unique("label_text"))
-    if len(banking_names) != 77 or not HELD_OUT_BANKING_INTENTS < banking_names:
-        raise ValueError("BANKING77 labels changed; review the held-out intent list")
-
-    choices = {
-        "banking77": sorted(banking_names - HELD_OUT_BANKING_INTENTS),
-        "banking77_final": sorted(banking_names),
-        "massive": sorted(massive["train"].unique("label_text")),
-        "clinc150": sorted(row["name"] for row in clinc_intents),
+    validation = {
+        "mnli": nli(mnli["validation_matched"], "mnli", VALIDATION_SIZE),
+        "snli": nli(snli["validation"], "snli", VALIDATION_SIZE),
+        "qqp": qqp_rows(qqp_held[:VALIDATION_SIZE], VALIDATION_SIZE),
+        "paws": paws_rows(paws["validation"], VALIDATION_SIZE),
+        "boolq": boolq_rows(boolq_held[:VALIDATION_SIZE]),
     }
-    if len(choices["massive"]) != 60 or len(choices["clinc150"]) != 150:
-        raise ValueError("An intent catalog changed; review the dataset mapping")
-
-    banking_train = [
-        {
-            "state": row["text"],
-            "source": "banking77",
-            "gold_intent": row["label_text"],
-        }
-        for row in banking["train"]
-        if row["label_text"] not in HELD_OUT_BANKING_INTENTS
-    ]
-
-    banking_train, banking_val = train_test_split(
-        banking_train,
-        test_size=0.1,
-        random_state=seed,
-        stratify=[row["gold_intent"] for row in banking_train],
-    )
-
-    clinc_names = {row["id"]: row["name"] for row in clinc_intents}
-    clinc_test = [
-        {
-            "state": row["utterance"],
-            "source": "clinc150",
-            "gold_intent": clinc_names[row["label"]],
-        }
-        for row in clinc["test"]
-        if row["label"] is not None
-    ]
-
-    xlam_train, xlam_val, xlam_test = split_by_group(xlam_rows(xlam), seed)
-    alfworld_train, alfworld_val, alfworld_test = split_by_group(
-        agent_rows(alfworld, "alfworld"), seed
-    )
-    webshop_train, webshop_val, webshop_test = split_by_group(
-        agent_rows(webshop, "webshop"), seed
-    )
-
-    return {
-        "train": banking_train
-        + massive_rows(massive, "train")
-        + xlam_train
-        + alfworld_train
-        + webshop_train,
-        "validation": {
-            "banking77": banking_val,
-            "massive": massive_rows(massive, "validation"),
-            "xlam": xlam_val,
-            "alfworld": alfworld_val,
-            "webshop": webshop_val,
-        },
-        "final": {
-            "banking77_seen": banking_test_rows(banking, False),
-            "banking77_held_out": banking_test_rows(banking, True),
-            "massive": massive_rows(massive, "test"),
-            "clinc150": clinc_test,
-            "xlam": xlam_test,
-            "alfworld": alfworld_test,
-            "webshop": webshop_test,
-        },
-        "choices": choices,
+    final = {
+        "mnli_mismatched": nli(mnli["validation_mismatched"], "mnli", FINAL_SIZE),
+        "snli": nli(snli["test"], "snli", FINAL_SIZE),
+        "qqp": qqp_rows(qqp_held[VALIDATION_SIZE:], FINAL_SIZE),
+        "paws": paws_rows(paws["test"], FINAL_SIZE),
+        "boolq": boolq_rows(boolq_held[VALIDATION_SIZE:]),
     }
+
+    return train, validation, final
+
+
+def mcq_data() -> tuple[list, dict, dict]:
+    csqa = load_dataset(
+        "tau/commonsense_qa", revision=DATASET_REVISIONS["tau/commonsense_qa"]
+    )
+    obqa = load_dataset(
+        "allenai/openbookqa", "main", revision=DATASET_REVISIONS["allenai/openbookqa"]
+    )
+    sciq = load_dataset("allenai/sciq", revision=DATASET_REVISIONS["allenai/sciq"])
+
+    def labelled(rows, source: str, stem: str) -> list:
+        out = []
+        for row in rows:
+            labels = list(row["choices"]["label"])
+            if row["answerKey"] not in labels:
+                continue
+            out.append(
+                letters_row(
+                    row[stem],
+                    MCQ_QUESTION,
+                    list(row["choices"]["text"]),
+                    labels.index(row["answerKey"]),
+                    source,
+                )
+            )
+        return out
+
+    def sciq_rows(rows) -> list:
+        out = []
+        for row in rows:
+            options = [
+                row["correct_answer"],
+                row["distractor1"],
+                row["distractor2"],
+                row["distractor3"],
+            ]
+            state = (
+                {"context": row["support"], "question": row["question"]}
+                if row["support"]
+                else row["question"]
+            )
+            out.append(letters_row(state, MCQ_QUESTION, options, 0, "sciq"))
+        return out
+
+    csqa_validation = labelled(csqa["validation"], "csqa", "question")
+    csqa_validation = sample(csqa_validation, len(csqa_validation))
+
+    train = (
+        labelled(csqa["train"], "csqa", "question")
+        + labelled(obqa["train"], "obqa", "question_stem")
+        + sciq_rows(sciq["train"])
+    )
+    validation = {
+        "csqa": csqa_validation[:VALIDATION_SIZE],
+        "obqa": labelled(obqa["validation"], "obqa", "question_stem"),
+        "sciq": sample(sciq_rows(sciq["validation"]), VALIDATION_SIZE),
+    }
+    final = {
+        "csqa": csqa_validation[VALIDATION_SIZE:],
+        "obqa": labelled(obqa["test"], "obqa", "question_stem"),
+        "sciq": sample(sciq_rows(sciq["test"]), FINAL_SIZE),
+    }
+
+    return train, validation, final
+
+
+def load_data(smoke: bool = False) -> dict:
+    train, validation, final = intent_data()
+
+    for source, (src_train, src_val, src_final) in {
+        "xlam": xlam_data(),
+        "alfworld": agent_data("alfworld"),
+        "webshop": agent_data("webshop"),
+    }.items():
+        train += src_train
+        validation[source] = src_val
+        final[source] = src_final
+
+    for src_train, src_val, src_final in (pair_data(), mcq_data()):
+        train += src_train
+        validation.update(src_val)
+        final.update(src_final)
+
+    if smoke:
+        train = sample(train, 3000)
+        validation = {k: sample(v, 32) for k, v in validation.items()}
+        final = {k: sample(v, 32) for k, v in final.items()}
+
+    return {"train": train, "validation": validation, "final": final}
 
 
 def encode_row(
-    row: dict,
-    choices: dict[str, list[str]],
-    tokenizer: PreTrainedTokenizerBase,
-    rng: Random,
+    row: dict, tokenizer: PreTrainedTokenizerBase, anchor_id: int, rng: Random
 ) -> dict:
-    catalog = row.get("choices") or choices[row.get("choice_pool", row["source"])]
-
-    if row["gold_intent"] not in catalog:
-        raise ValueError(f"Unknown intent: {row['source']}/{row['gold_intent']}")
-
-    candidates = catalog.copy()
-    rng.shuffle(candidates)
-
-    question = Choice(
-        criteria={readable_intent(candidate): None for candidate in candidates},
-        instructions=row.get("question", QUESTION),
-    )
-
-    if len(question.criteria) != len(candidates):
-        raise ValueError("Two candidates render to the same label")
-
-    encoded = encode_question(tokenizer, row["state"], question, tokenizer.pad_token_id)
+    question, gold = build_question(row, rng)
+    encoded = encode_question(tokenizer, row["state"], question, anchor_id)
 
     return {
         "input_ids": encoded["input_ids"],
         "choice_slots": encoded["choice_slots"],
-        "target": candidates.index(row["gold_intent"]),
-        "choice_count": len(candidates),
+        "target": encoded["keys"].index(gold),
+        "choice_count": len(encoded["keys"]),
     }
 
 
-def collate_batch(
-    batch: list[dict], pad_token_id: int, device: str
-) -> dict[str, Tensor]:
+def collate_batch(batch: list[dict], pad_id: int, device: str) -> dict[str, Tensor]:
     lengths = [len(example["input_ids"]) for example in batch]
-    max_len = max(lengths)
-    max_choices = max(example["choice_count"] for example in batch)
+    width = max(lengths)
+    choices = max(example["choice_count"] for example in batch)
 
-    padded_ids = torch.full((len(batch), max_len), pad_token_id, dtype=torch.long)
-    padded_slots = torch.full((len(batch), max_len), -1, dtype=torch.long)
-    choice_mask = torch.zeros((len(batch), max_choices), dtype=torch.bool)
+    input_ids = torch.full((len(batch), width), pad_id, dtype=torch.long)
+    choice_slots = torch.full((len(batch), width), -1, dtype=torch.long)
+    choice_mask = torch.zeros((len(batch), choices), dtype=torch.bool)
 
     for i, example in enumerate(batch):
-        padded_ids[i, : lengths[i]] = example["input_ids"]
-        padded_slots[i, : lengths[i]] = example["choice_slots"]
+        input_ids[i, : lengths[i]] = example["input_ids"]
+        choice_slots[i, : lengths[i]] = example["choice_slots"]
         choice_mask[i, : example["choice_count"]] = True
 
     return {
-        "input_ids": padded_ids.to(device),
-        "choice_slots": padded_slots.to(device),
-        "choice_mask": choice_mask.to(device),
+        "input_ids": input_ids.to(device),
         "lengths": torch.tensor(lengths, device=device),
-        "targets": torch.tensor(
-            [example["target"] for example in batch], device=device
-        ),
+        "choice_slots": choice_slots.to(device),
+        "choice_mask": choice_mask.to(device),
+        "targets": torch.tensor([e["target"] for e in batch], device=device),
     }
 
 
 def make_batches(
-    examples: list[dict[str, str]],
-    choices: dict[str, list[str]],
+    rows: list[dict],
     tokenizer: PreTrainedTokenizerBase,
+    anchor_id: int,
     batch_size: int,
     max_tokens: int,
     device: str,
@@ -350,23 +567,18 @@ def make_batches(
     shuffle: bool = False,
     bucket_size: int = 2048,
 ) -> Iterator[dict[str, Tensor]]:
-
-    if tokenizer.pad_token is None or tokenizer.pad_token_id is None:
-        raise ValueError("The tokenizer needs a pad token for choice anchors")
-
-    rows = examples.copy()
+    rows = rows.copy()
     if shuffle:
         rng.shuffle(rows)
 
     for start in range(0, len(rows), bucket_size):
         encoded = [
-            encode_row(row, choices, tokenizer, rng)
+            encode_row(row, tokenizer, anchor_id, rng)
             for row in rows[start : start + bucket_size]
         ]
         encoded.sort(key=lambda example: len(example["input_ids"]))
 
         batches, batch, longest = [], [], 0
-
         for example in encoded:
             length = len(example["input_ids"])
 
@@ -386,4 +598,4 @@ def make_batches(
             rng.shuffle(batches)
 
         for batch in batches:
-            yield collate_batch(batch, tokenizer.pad_token_id, device)
+            yield collate_batch(batch, anchor_id, device)
