@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Decision Index suite build (licensed data, never commit)
+suite-build/
